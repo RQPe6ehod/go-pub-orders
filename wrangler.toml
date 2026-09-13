@@ -8,7 +8,7 @@ class_name = "OrderBoard"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["OrderBoard"]
+new_sqlite_classes = ["OrderBoard"]
 
 [vars]
 PIN_WAITER = "1111"
