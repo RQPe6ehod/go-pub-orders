@@ -351,6 +351,7 @@ export class OrderBoard {
             table,
             openedAt: session.openedAt,
             closedAt: Date.now(),
+            closedBy: conn.staffName || null,
             items,
             subtotal,
             service,
