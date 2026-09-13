@@ -38,6 +38,7 @@ export class OrderBoard {
     this.tableCount = 20;
     this.unavailable = {}; // key "kitchen|Name" or "bar|Name" -> {comment, disabledBy, disabledAt}
     this.pins = { waiter: "1111", cook: "1111", bartender: "1111", manager: "1111" };
+    this.inventory = { kitchen: {}, bar: {} }; // dest -> { "Name": {qty, threshold} }
     this.ready = this.state.blockConcurrencyWhile(async () => {
       const storedOrders = await this.state.storage.get("orders");
       const storedHistory = await this.state.storage.get("history");
@@ -47,6 +48,7 @@ export class OrderBoard {
       const storedTableCount = await this.state.storage.get("tableCount");
       const storedUnavailable = await this.state.storage.get("unavailable");
       const storedPins = await this.state.storage.get("pins");
+      const storedInventory = await this.state.storage.get("inventory");
       if (storedOrders) this.orders = storedOrders;
       if (storedHistory) this.history = storedHistory;
       if (storedOpen) this.openTables = storedOpen;
@@ -55,6 +57,7 @@ export class OrderBoard {
       if (storedTableCount) this.tableCount = storedTableCount;
       if (storedUnavailable) this.unavailable = storedUnavailable;
       if (storedPins) this.pins = storedPins;
+      if (storedInventory) this.inventory = storedInventory;
     });
   }
 
@@ -67,6 +70,7 @@ export class OrderBoard {
     await this.state.storage.put("tableCount", this.tableCount);
     await this.state.storage.put("unavailable", this.unavailable);
     await this.state.storage.put("pins", this.pins);
+    await this.state.storage.put("inventory", this.inventory);
   }
 
   stateSnapshot() {
@@ -79,6 +83,7 @@ export class OrderBoard {
       staff: this.staff,
       tableCount: this.tableCount,
       unavailable: this.unavailable,
+      inventory: this.inventory,
     };
   }
 
@@ -100,6 +105,17 @@ export class OrderBoard {
 
   sendTo(conn, message) {
     try { conn.ws.send(JSON.stringify(message)); } catch (e) {}
+  }
+
+  consumeStock(dest, items, notifyRole) {
+    (items || []).forEach(i => {
+      const stock = this.inventory[dest][i.name];
+      if (!stock) return; // not tracked — nothing to do
+      stock.qty = Math.max(0, stock.qty - (i.qty || 1));
+      if (stock.qty <= stock.threshold) {
+        this.notify(notifyRole, { kind: "low_stock", name: i.name, qty: stock.qty });
+      }
+    });
   }
 
   checkPin(role, pin) {
@@ -248,6 +264,22 @@ export class OrderBoard {
           this.broadcast();
         }
 
+        if (msg.type === "set_stock" && (conn.role === "cook" || conn.role === "bartender")) {
+          const dest = conn.role === "cook" ? "kitchen" : "bar";
+          const qty = Math.max(0, parseInt(msg.qty, 10) || 0);
+          const threshold = Math.max(0, parseInt(msg.threshold, 10) || 0);
+          this.inventory[dest][msg.name] = { qty, threshold };
+          await this.persist();
+          this.broadcast();
+        }
+
+        if (msg.type === "clear_stock" && (conn.role === "cook" || conn.role === "bartender")) {
+          const dest = conn.role === "cook" ? "kitchen" : "bar";
+          delete this.inventory[dest][msg.name];
+          await this.persist();
+          this.broadcast();
+        }
+
         if (msg.type === "new_order") {
           const table = msg.table;
           if (!this.openTables[table]) {
@@ -315,6 +347,7 @@ export class OrderBoard {
           if (order) {
             order.kitchenStatus = "ready";
             order.kitchenReadyAt = Date.now();
+            this.consumeStock("kitchen", order.kitchenItems, "cook");
             await this.persist();
             this.broadcast();
             this.notify("waiter", { table: order.table, orderId: order.id, part: "kitchen" });
@@ -326,6 +359,7 @@ export class OrderBoard {
           if (order) {
             order.barStatus = "ready";
             order.barReadyAt = Date.now();
+            this.consumeStock("bar", order.barItems, "bartender");
             await this.persist();
             this.broadcast();
             this.notify("waiter", { table: order.table, orderId: order.id, part: "bar" });
