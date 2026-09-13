@@ -227,7 +227,7 @@ export class OrderBoard {
             id: crypto.randomUUID(),
             table,
             createdAt: Date.now(),
-            waiterName: conn.staffName || null,
+            waiterName: conn.staffName || "",
             kitchenItems,
             barItems,
             kitchenStatus: kitchenItems.length ? "pending" : "none",
@@ -252,7 +252,7 @@ export class OrderBoard {
           if (order && order.kitchenStatus === "pending") {
             order.kitchenStatus = "accepted";
             order.kitchenAcceptedAt = Date.now();
-            order.cookName = conn.staffName || null;
+            order.cookName = conn.staffName || "";
             await this.persist();
             this.broadcast();
           }
@@ -263,7 +263,7 @@ export class OrderBoard {
           if (order && order.barStatus === "pending") {
             order.barStatus = "accepted";
             order.barAcceptedAt = Date.now();
-            order.bartenderName = conn.staffName || null;
+            order.bartenderName = conn.staffName || "";
             await this.persist();
             this.broadcast();
           }
@@ -351,7 +351,7 @@ export class OrderBoard {
             table,
             openedAt: session.openedAt,
             closedAt: Date.now(),
-            closedBy: conn.staffName || null,
+            closedBy: conn.staffName || "",
             items,
             subtotal,
             service,
@@ -396,4 +396,3 @@ export default {
     return new Response("GO pub order board is running.", { headers: cors });
   },
 };
-
