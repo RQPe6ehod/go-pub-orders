@@ -212,3 +212,4 @@ export default {
     return new Response("GO pub order board is running.", { headers: cors });
   },
 };
+
