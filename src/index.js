@@ -1,11 +1,18 @@
 // GO pub — order board backend.
-// One Durable Object instance ("main") holds all active orders plus a
-// short served-order history, and broadcasts every change to every
-// connected client (waiter / cook / bartender / manager) over WebSocket.
-// Each role must present the matching PIN (set in wrangler.toml [vars])
-// before it is allowed to send anything.
+// One Durable Object instance ("main") holds:
+//  - orders: active kitchen/bar tickets (accept -> ready -> served)
+//  - openTables: tables currently occupied (a "tab"), independent of
+//    individual ticket status — stays open across multiple rounds until
+//    the waiter explicitly closes the table
+//  - history: served order tickets (used to reconstruct a table's full bill)
+//  - closedTables: finalized receipts for closed tables
+// Everything is broadcast to every connected client (waiter / cook /
+// bartender / manager) over WebSocket. Each role must present the
+// matching PIN (set in wrangler.toml [vars]) before it can send anything.
 
 const HISTORY_LIMIT = 500;
+const CLOSED_TABLES_LIMIT = 300;
+const SERVICE_RATE = 0.10;
 
 function parsePrice(p) {
   if (typeof p === "number") return p;
@@ -25,21 +32,54 @@ export class OrderBoard {
     this.sockets = new Set(); // { ws, role, authed }
     this.orders = [];
     this.history = [];
+    this.openTables = {};
+    this.closedTables = [];
+    this.staff = [];       // [{id, role, name}]
+    this.tableCount = 20;
+    this.unavailable = {}; // key "kitchen|Name" or "bar|Name" -> {comment, disabledBy, disabledAt}
     this.ready = this.state.blockConcurrencyWhile(async () => {
       const storedOrders = await this.state.storage.get("orders");
       const storedHistory = await this.state.storage.get("history");
+      const storedOpen = await this.state.storage.get("openTables");
+      const storedClosed = await this.state.storage.get("closedTables");
+      const storedStaff = await this.state.storage.get("staff");
+      const storedTableCount = await this.state.storage.get("tableCount");
+      const storedUnavailable = await this.state.storage.get("unavailable");
       if (storedOrders) this.orders = storedOrders;
       if (storedHistory) this.history = storedHistory;
+      if (storedOpen) this.openTables = storedOpen;
+      if (storedClosed) this.closedTables = storedClosed;
+      if (storedStaff) this.staff = storedStaff;
+      if (storedTableCount) this.tableCount = storedTableCount;
+      if (storedUnavailable) this.unavailable = storedUnavailable;
     });
   }
 
   async persist() {
     await this.state.storage.put("orders", this.orders);
     await this.state.storage.put("history", this.history);
+    await this.state.storage.put("openTables", this.openTables);
+    await this.state.storage.put("closedTables", this.closedTables);
+    await this.state.storage.put("staff", this.staff);
+    await this.state.storage.put("tableCount", this.tableCount);
+    await this.state.storage.put("unavailable", this.unavailable);
+  }
+
+  stateSnapshot() {
+    return {
+      type: "state",
+      orders: this.orders,
+      history: this.history,
+      openTables: this.openTables,
+      closedTables: this.closedTables,
+      staff: this.staff,
+      tableCount: this.tableCount,
+      unavailable: this.unavailable,
+    };
   }
 
   broadcast() {
-    const payload = JSON.stringify({ type: "state", orders: this.orders, history: this.history });
+    const payload = JSON.stringify(this.stateSnapshot());
     for (const client of this.sockets) {
       try { client.ws.send(payload); } catch (e) { /* ignore dead sockets */ }
     }
@@ -52,6 +92,10 @@ export class OrderBoard {
         try { client.ws.send(payload); } catch (e) {}
       }
     }
+  }
+
+  sendTo(conn, message) {
+    try { conn.ws.send(JSON.stringify(message)); } catch (e) {}
   }
 
   checkPin(role, pin) {
@@ -81,40 +125,126 @@ export class OrderBoard {
         try { msg = JSON.parse(evt.data); } catch (e) { return; }
 
         if (msg.type === "hello") {
-          if (!this.checkPin(msg.role, msg.pin)) {
-            server.send(JSON.stringify({ type: "auth_error" }));
-            server.close(4001, "bad pin");
-            this.sockets.delete(conn);
-            return;
+          if (msg.staffId) {
+            const staff = this.staff.find(s => s.id === msg.staffId && s.role === msg.role);
+            if (!staff) {
+              server.send(JSON.stringify({ type: "auth_error", reason: "unknown_staff" }));
+              server.close(4001, "unknown staff");
+              this.sockets.delete(conn);
+              return;
+            }
+            conn.role = msg.role;
+            conn.staffId = staff.id;
+            conn.staffName = staff.name || "";
+            conn.authed = true;
+          } else {
+            if (!this.checkPin(msg.role, msg.pin)) {
+              server.send(JSON.stringify({ type: "auth_error" }));
+              server.close(4001, "bad pin");
+              this.sockets.delete(conn);
+              return;
+            }
+            conn.role = msg.role;
+            conn.authed = true;
           }
-          conn.role = msg.role;
-          conn.authed = true;
           server.send(JSON.stringify({ type: "auth_ok" }));
-          server.send(JSON.stringify({ type: "state", orders: this.orders, history: this.history }));
+          server.send(JSON.stringify(this.stateSnapshot()));
           return;
         }
 
-        if (!conn.authed) return; // ignore everything until hello+pin succeeds
+        if (!conn.authed) return; // ignore everything until hello succeeds
+
+        if (msg.type === "set_staff_name") {
+          const staff = this.staff.find(s => s.id === msg.staffId);
+          if (staff && conn.staffId === msg.staffId) {
+            staff.name = String(msg.name || "").slice(0, 40);
+            conn.staffName = staff.name;
+            await this.persist();
+            this.broadcast();
+          }
+        }
+
+        if (msg.type === "create_staff" && conn.role === "manager") {
+          const staff = { id: crypto.randomUUID(), role: msg.role, name: "" };
+          this.staff.push(staff);
+          await this.persist();
+          this.broadcast();
+        }
+
+        if (msg.type === "delete_staff" && conn.role === "manager") {
+          this.staff = this.staff.filter(s => s.id !== msg.staffId);
+          await this.persist();
+          this.broadcast();
+        }
+
+        if (msg.type === "set_table_count" && conn.role === "manager") {
+          const n = parseInt(msg.count, 10);
+          if (n && n > 0 && n <= 200) {
+            this.tableCount = n;
+            await this.persist();
+            this.broadcast();
+          }
+        }
+
+        if (msg.type === "disable_items" && (conn.role === "cook" || conn.role === "bartender")) {
+          const dest = conn.role === "cook" ? "kitchen" : "bar";
+          (msg.items || []).forEach(i => {
+            this.unavailable[dest + "|" + i.name] = {
+              comment: String(i.comment || "").slice(0, 200),
+              disabledBy: conn.staffName || null,
+              disabledAt: Date.now(),
+            };
+          });
+          await this.persist();
+          this.broadcast();
+          this.notify("manager", { kind: "menu_disabled", dest, names: (msg.items || []).map(i => i.name) });
+        }
+
+        if (msg.type === "enable_items" && (conn.role === "cook" || conn.role === "bartender")) {
+          const dest = conn.role === "cook" ? "kitchen" : "bar";
+          (msg.names || []).forEach(name => { delete this.unavailable[dest + "|" + name]; });
+          await this.persist();
+          this.broadcast();
+        }
 
         if (msg.type === "new_order") {
+          const table = msg.table;
+          if (!this.openTables[table]) {
+            this.openTables[table] = { openedAt: Date.now() };
+          }
+
+          const isAvailable = (dest, name) => !this.unavailable[dest + "|" + name];
+          const rawKitchen = msg.kitchenItems || [];
+          const rawBar = msg.barItems || [];
+          const kitchenItems = rawKitchen.filter(i => isAvailable("kitchen", i.name));
+          const barItems = rawBar.filter(i => isAvailable("bar", i.name));
+          const removed = [
+            ...rawKitchen.filter(i => !isAvailable("kitchen", i.name)).map(i => i.name),
+            ...rawBar.filter(i => !isAvailable("bar", i.name)).map(i => i.name),
+          ];
+
           const order = {
             id: crypto.randomUUID(),
-            table: msg.table,
+            table,
             createdAt: Date.now(),
-            kitchenItems: msg.kitchenItems || [],
-            barItems: msg.barItems || [],
-            kitchenStatus: (msg.kitchenItems && msg.kitchenItems.length) ? "pending" : "none",
-            barStatus: (msg.barItems && msg.barItems.length) ? "pending" : "none",
+            waiterName: conn.staffName || null,
+            kitchenItems,
+            barItems,
+            kitchenStatus: kitchenItems.length ? "pending" : "none",
+            barStatus: barItems.length ? "pending" : "none",
             kitchenAcceptedAt: null,
             kitchenReadyAt: null,
             barAcceptedAt: null,
             barReadyAt: null,
+            cookName: null,
+            bartenderName: null,
           };
           this.orders.push(order);
           await this.persist();
           this.broadcast();
           if (order.kitchenStatus === "pending") this.notify("cook", { table: order.table, orderId: order.id });
           if (order.barStatus === "pending") this.notify("bartender", { table: order.table, orderId: order.id });
+          if (removed.length) this.sendTo(conn, { type: "items_removed", names: removed });
         }
 
         if (msg.type === "kitchen_accept") {
@@ -122,6 +252,7 @@ export class OrderBoard {
           if (order && order.kitchenStatus === "pending") {
             order.kitchenStatus = "accepted";
             order.kitchenAcceptedAt = Date.now();
+            order.cookName = conn.staffName || null;
             await this.persist();
             this.broadcast();
           }
@@ -132,6 +263,7 @@ export class OrderBoard {
           if (order && order.barStatus === "pending") {
             order.barStatus = "accepted";
             order.barAcceptedAt = Date.now();
+            order.bartenderName = conn.staffName || null;
             await this.persist();
             this.broadcast();
           }
@@ -182,6 +314,57 @@ export class OrderBoard {
           await this.persist();
           this.broadcast();
         }
+
+        if (msg.type === "close_table") {
+          const table = msg.table;
+          const session = this.openTables[table];
+          if (!session) {
+            this.sendTo(conn, { type: "close_error", table, reason: "not_open" });
+            return;
+          }
+          const pending = this.orders.filter(o => o.table === table);
+          if (pending.length > 0) {
+            this.sendTo(conn, { type: "close_error", table, reason: "pending_items" });
+            return;
+          }
+
+          const rounds = this.history.filter(h => h.table === table && h.servedAt >= session.openedAt);
+          const merged = {}; // key: dest|name -> {name, qty, price}
+          rounds.forEach(r => {
+            (r.kitchenItems || []).forEach(i => {
+              const key = "kitchen|" + i.name;
+              if (!merged[key]) merged[key] = { name: i.name, qty: 0, price: i.price };
+              merged[key].qty += i.qty;
+            });
+            (r.barItems || []).forEach(i => {
+              const key = "bar|" + i.name;
+              if (!merged[key]) merged[key] = { name: i.name, qty: 0, price: i.price };
+              merged[key].qty += i.qty;
+            });
+          });
+          const items = Object.values(merged);
+          const subtotal = items.reduce((s, i) => s + parsePrice(i.price) * i.qty, 0);
+          const service = Math.round(subtotal * SERVICE_RATE);
+          const total = subtotal + service;
+
+          const receipt = {
+            table,
+            openedAt: session.openedAt,
+            closedAt: Date.now(),
+            items,
+            subtotal,
+            service,
+            total,
+          };
+
+          delete this.openTables[table];
+          this.closedTables.push(receipt);
+          if (this.closedTables.length > CLOSED_TABLES_LIMIT) this.closedTables = this.closedTables.slice(-CLOSED_TABLES_LIMIT);
+
+          await this.persist();
+          this.broadcast();
+          this.sendTo(conn, { type: "table_closed", receipt });
+        }
       });
 
       server.addEventListener("close", () => this.sockets.delete(conn));
@@ -212,4 +395,3 @@ export default {
     return new Response("GO pub order board is running.", { headers: cors });
   },
 };
-
