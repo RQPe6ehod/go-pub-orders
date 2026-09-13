@@ -37,6 +37,7 @@ export class OrderBoard {
     this.staff = [];       // [{id, role, name}]
     this.tableCount = 20;
     this.unavailable = {}; // key "kitchen|Name" or "bar|Name" -> {comment, disabledBy, disabledAt}
+    this.pins = { waiter: "1111", cook: "1111", bartender: "1111", manager: "1111" };
     this.ready = this.state.blockConcurrencyWhile(async () => {
       const storedOrders = await this.state.storage.get("orders");
       const storedHistory = await this.state.storage.get("history");
@@ -45,6 +46,7 @@ export class OrderBoard {
       const storedStaff = await this.state.storage.get("staff");
       const storedTableCount = await this.state.storage.get("tableCount");
       const storedUnavailable = await this.state.storage.get("unavailable");
+      const storedPins = await this.state.storage.get("pins");
       if (storedOrders) this.orders = storedOrders;
       if (storedHistory) this.history = storedHistory;
       if (storedOpen) this.openTables = storedOpen;
@@ -52,6 +54,7 @@ export class OrderBoard {
       if (storedStaff) this.staff = storedStaff;
       if (storedTableCount) this.tableCount = storedTableCount;
       if (storedUnavailable) this.unavailable = storedUnavailable;
+      if (storedPins) this.pins = storedPins;
     });
   }
 
@@ -63,6 +66,7 @@ export class OrderBoard {
     await this.state.storage.put("staff", this.staff);
     await this.state.storage.put("tableCount", this.tableCount);
     await this.state.storage.put("unavailable", this.unavailable);
+    await this.state.storage.put("pins", this.pins);
   }
 
   stateSnapshot() {
@@ -99,7 +103,7 @@ export class OrderBoard {
   }
 
   checkPin(role, pin) {
-    const expected = this.env["PIN_" + String(role || "").toUpperCase()];
+    const expected = this.pins[role];
     if (!expected) return true; // no PIN configured for this role -> allow
     return String(pin || "") === String(expected);
   }
@@ -152,6 +156,16 @@ export class OrderBoard {
           return;
         }
 
+        if (msg.type === "get_receipt") {
+          // Public, unauthenticated lookup — this is what a QR code or a
+          // shared WhatsApp/Telegram link points a guest or a manager to.
+          const receipt = this.closedTables.find(r => r.id === msg.id);
+          this.sendTo(conn, receipt
+            ? { type: "receipt_data", receipt }
+            : { type: "receipt_not_found", id: msg.id });
+          return;
+        }
+
         if (!conn.authed) return; // ignore everything until hello succeeds
 
         if (msg.type === "set_staff_name") {
@@ -161,6 +175,24 @@ export class OrderBoard {
             conn.staffName = staff.name;
             await this.persist();
             this.broadcast();
+          }
+        }
+
+        if (msg.type === "set_display_name" && !conn.staffId) {
+          // For connections logged in with the shared role PIN (no personal
+          // staff record) — the name only lives on this connection and is
+          // re-sent by the client after every reconnect.
+          conn.staffName = String(msg.name || "").slice(0, 40);
+        }
+
+        if (msg.type === "change_pin" && conn.role === msg.role) {
+          const newPin = String(msg.newPin || "").trim();
+          if (newPin.length >= 4 && newPin.length <= 6 && /^\d+$/.test(newPin)) {
+            this.pins[msg.role] = newPin;
+            await this.persist();
+            this.sendTo(conn, { type: "pin_changed", role: msg.role });
+          } else {
+            this.sendTo(conn, { type: "pin_change_error", reason: "invalid" });
           }
         }
 
@@ -175,6 +207,15 @@ export class OrderBoard {
           this.staff = this.staff.filter(s => s.id !== msg.staffId);
           await this.persist();
           this.broadcast();
+        }
+
+        if (msg.type === "reassign_staff" && conn.role === "manager") {
+          const staff = this.staff.find(s => s.id === msg.staffId);
+          if (staff) {
+            staff.id = crypto.randomUUID(); // old device's cached id stops matching anyone
+            await this.persist();
+            this.broadcast();
+          }
         }
 
         if (msg.type === "set_table_count" && conn.role === "manager") {
@@ -348,6 +389,7 @@ export class OrderBoard {
           const total = subtotal + service;
 
           const receipt = {
+            id: crypto.randomUUID(),
             table,
             openedAt: session.openedAt,
             closedAt: Date.now(),
