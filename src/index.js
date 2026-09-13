@@ -25,6 +25,112 @@ function lineTotal(items) {
   return (items || []).reduce((sum, i) => sum + parsePrice(i.price) * (i.qty || 1), 0);
 }
 
+// ---------------------------------------------------------------------
+// Web Push (RFC 8291 payload encryption + RFC 8292 VAPID), implemented
+// with the platform's built-in Web Crypto API only — no npm dependency,
+// since this Worker is deployed as a single plain file.
+// ---------------------------------------------------------------------
+
+function b64urlToBytes(s) {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function bytesToB64url(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function concatBytes(...arrs) {
+  const len = arrs.reduce((s, a) => s + a.length, 0);
+  const out = new Uint8Array(len);
+  let off = 0;
+  for (const a of arrs) { out.set(a, off); off += a.length; }
+  return out;
+}
+async function hmacSha256(keyBytes, dataBytes) {
+  const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return new Uint8Array(await crypto.subtle.sign("HMAC", key, dataBytes));
+}
+async function hkdfExpand(prk, info, length) {
+  const t1 = await hmacSha256(prk, concatBytes(info, new Uint8Array([1])));
+  return t1.slice(0, length);
+}
+
+async function encryptWebPushPayload(payloadBytes, p256dhB64url, authB64url) {
+  const clientPublicKeyBytes = b64urlToBytes(p256dhB64url); // 65 bytes
+  const authSecret = b64urlToBytes(authB64url); // 16 bytes
+
+  const clientKey = await crypto.subtle.importKey("raw", clientPublicKeyBytes, { name: "ECDH", namedCurve: "P-256" }, false, []);
+  const serverKeyPair = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  const serverPublicKeyBytes = new Uint8Array(await crypto.subtle.exportKey("raw", serverKeyPair.publicKey));
+
+  const sharedSecret = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: clientKey }, serverKeyPair.privateKey, 256));
+
+  const prkKey = await hmacSha256(authSecret, sharedSecret);
+  const keyInfo = concatBytes(
+    new TextEncoder().encode("WebPush: info"),
+    new Uint8Array([0]),
+    clientPublicKeyBytes,
+    serverPublicKeyBytes
+  );
+  const ikm = await hkdfExpand(prkKey, keyInfo, 32);
+
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const prk = await hmacSha256(salt, ikm);
+
+  const cek = await hkdfExpand(prk, concatBytes(new TextEncoder().encode("Content-Encoding: aes128gcm"), new Uint8Array([0])), 16);
+  const nonce = await hkdfExpand(prk, concatBytes(new TextEncoder().encode("Content-Encoding: nonce"), new Uint8Array([0])), 12);
+
+  const paddedPlaintext = concatBytes(payloadBytes, new Uint8Array([2])); // delimiter for a single (final) record
+  const cekKey = await crypto.subtle.importKey("raw", cek, { name: "AES-GCM" }, false, ["encrypt"]);
+  const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, tagLength: 128 }, cekKey, paddedPlaintext));
+
+  const rsBytes = new Uint8Array(4);
+  new DataView(rsBytes.buffer).setUint32(0, 4096, false);
+  const header = concatBytes(salt, rsBytes, new Uint8Array([serverPublicKeyBytes.length]), serverPublicKeyBytes);
+
+  return concatBytes(header, ciphertext);
+}
+
+async function buildVapidAuthHeader(endpoint, subject, publicKeyB64url, privateKeyPkcs8B64) {
+  const aud = new URL(endpoint).origin;
+  const header = { typ: "JWT", alg: "ES256" };
+  const claims = { aud, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: subject };
+  const enc = (obj) => bytesToB64url(new TextEncoder().encode(JSON.stringify(obj)));
+  const signingInput = enc(header) + "." + enc(claims);
+
+  const pkcs8Bytes = Uint8Array.from(atob(privateKeyPkcs8B64), c => c.charCodeAt(0));
+  const privateKey = await crypto.subtle.importKey("pkcs8", pkcs8Bytes, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+  const sig = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, privateKey, new TextEncoder().encode(signingInput)));
+
+  return `vapid t=${signingInput}.${bytesToB64url(sig)}, k=${publicKeyB64url}`;
+}
+
+async function sendWebPush(subscription, payloadObj, env) {
+  const payloadBytes = new TextEncoder().encode(JSON.stringify(payloadObj));
+  const body = await encryptWebPushPayload(payloadBytes, subscription.keys.p256dh, subscription.keys.auth);
+  const auth = await buildVapidAuthHeader(
+    subscription.endpoint,
+    env.VAPID_SUBJECT || "mailto:admin@example.com",
+    env.VAPID_PUBLIC_KEY,
+    env.VAPID_PRIVATE_KEY_PKCS8
+  );
+  return fetch(subscription.endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: auth,
+      "Content-Type": "application/octet-stream",
+      "Content-Encoding": "aes128gcm",
+      TTL: "60",
+    },
+    body,
+  });
+}
+
 export class OrderBoard {
   constructor(state, env) {
     this.state = state;
@@ -39,6 +145,7 @@ export class OrderBoard {
     this.unavailable = {}; // key "kitchen|Name" or "bar|Name" -> {comment, disabledBy, disabledAt}
     this.pins = { waiter: "1111", cook: "1111", bartender: "1111", manager: "1111" };
     this.inventory = { kitchen: {}, bar: {} }; // dest -> { "Name": {qty, threshold} }
+    this.pushSubs = []; // [{id, role, staffId, subscription}]
     this.ready = this.state.blockConcurrencyWhile(async () => {
       const storedOrders = await this.state.storage.get("orders");
       const storedHistory = await this.state.storage.get("history");
@@ -49,6 +156,7 @@ export class OrderBoard {
       const storedUnavailable = await this.state.storage.get("unavailable");
       const storedPins = await this.state.storage.get("pins");
       const storedInventory = await this.state.storage.get("inventory");
+      const storedPushSubs = await this.state.storage.get("pushSubs");
       if (storedOrders) this.orders = storedOrders;
       if (storedHistory) this.history = storedHistory;
       if (storedOpen) this.openTables = storedOpen;
@@ -58,6 +166,7 @@ export class OrderBoard {
       if (storedUnavailable) this.unavailable = storedUnavailable;
       if (storedPins) this.pins = storedPins;
       if (storedInventory) this.inventory = storedInventory;
+      if (storedPushSubs) this.pushSubs = storedPushSubs;
     });
   }
 
@@ -71,6 +180,7 @@ export class OrderBoard {
     await this.state.storage.put("unavailable", this.unavailable);
     await this.state.storage.put("pins", this.pins);
     await this.state.storage.put("inventory", this.inventory);
+    await this.state.storage.put("pushSubs", this.pushSubs);
   }
 
   stateSnapshot() {
@@ -84,6 +194,7 @@ export class OrderBoard {
       tableCount: this.tableCount,
       unavailable: this.unavailable,
       inventory: this.inventory,
+      vapidPublicKey: this.env.VAPID_PUBLIC_KEY || null,
     };
   }
 
@@ -101,6 +212,30 @@ export class OrderBoard {
         try { client.ws.send(payload); } catch (e) {}
       }
     }
+    this.pushToRole(role, message);
+  }
+
+  pushText(message) {
+    if (message.kind === "low_stock") return { title: "GO pub — заканчивается", body: `${message.name} — осталось ${message.qty}` };
+    if (message.part) return { title: "GO pub — готово", body: `Стол ${message.table} (${message.part === "kitchen" ? "кухня" : "бар"})` };
+    if (message.table !== undefined) return { title: "GO pub — новый заказ", body: `Стол ${message.table}` };
+    return { title: "GO pub", body: "Новое уведомление" };
+  }
+
+  pushToRole(role, message) {
+    const subs = this.pushSubs.filter(p => p.role === role);
+    if (subs.length === 0) return;
+    const text = this.pushText(message);
+    subs.forEach(p => {
+      sendWebPush(p.subscription, text, this.env)
+        .then(async (resp) => {
+          if (resp && (resp.status === 404 || resp.status === 410)) {
+            this.pushSubs = this.pushSubs.filter(x => x.id !== p.id);
+            await this.persist();
+          }
+        })
+        .catch(() => {});
+    });
   }
 
   sendTo(conn, message) {
@@ -157,6 +292,14 @@ export class OrderBoard {
             conn.staffId = staff.id;
             conn.staffName = staff.name || "";
             conn.authed = true;
+          } else if (msg.role !== "manager") {
+            // Waiter/cook/bartender can no longer fall back to a shared PIN —
+            // a valid personal QR link (staffId) is required. This is what
+            // makes deleting/reassigning a staff member actually revoke access.
+            server.send(JSON.stringify({ type: "auth_error", reason: "staff_required" }));
+            server.close(4001, "staff id required");
+            this.sockets.delete(conn);
+            return;
           } else {
             if (!this.checkPin(msg.role, msg.pin)) {
               server.send(JSON.stringify({ type: "auth_error" }));
@@ -183,6 +326,17 @@ export class OrderBoard {
         }
 
         if (!conn.authed) return; // ignore everything until hello succeeds
+
+        if (msg.type === "register_push" && msg.pushId && msg.subscription) {
+          this.pushSubs = this.pushSubs.filter(p => p.id !== msg.pushId);
+          this.pushSubs.push({ id: msg.pushId, role: conn.role, staffId: conn.staffId || null, subscription: msg.subscription });
+          await this.persist();
+        }
+
+        if (msg.type === "unregister_push" && msg.pushId) {
+          this.pushSubs = this.pushSubs.filter(p => p.id !== msg.pushId);
+          await this.persist();
+        }
 
         if (msg.type === "set_staff_name") {
           const staff = this.staff.find(s => s.id === msg.staffId);

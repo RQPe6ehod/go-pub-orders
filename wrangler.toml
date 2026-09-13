@@ -10,9 +10,12 @@ class_name = "OrderBoard"
 tag = "v1"
 new_sqlite_classes = ["OrderBoard"]
 
+# PINs are no longer set here — they default to 1111 for every role and are
+# stored/changed from inside each interface (see the change_pin message in
+# src/index.js). This section is intentionally left empty.
+
 [vars]
-PIN_WAITER = "1111"
-PIN_COOK = "2222"
-PIN_BARTENDER = "3333"
-PIN_MANAGER = "9999"
+VAPID_PUBLIC_KEY = "BEcgGxZAt9ixrngaU78SVJYgquFAsY2fPGI7ASrpxXU8azqEHNUixNn4pbihJjGiZSAWs0K81octCrRx81xUi5I"
+VAPID_PRIVATE_KEY_PKCS8 = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgnpgRF8MKidE5C8/Sktl3wHn9JKQ2iuHQoAyvL5kWoiShRANCAARHIBsWQLfYsa54GlO/ElSWIKrhQLGNnzxiOwEq6cV1PGs6hBzVIsTZ+KW4oSYxomUgFrNCvNaHLQq0cfNcVIuS"
+VAPID_SUBJECT = "mailto:admin@kuatov.kz"
 
