@@ -105,6 +105,10 @@ export class OrderBoard {
             barItems: msg.barItems || [],
             kitchenStatus: (msg.kitchenItems && msg.kitchenItems.length) ? "pending" : "none",
             barStatus: (msg.barItems && msg.barItems.length) ? "pending" : "none",
+            kitchenAcceptedAt: null,
+            kitchenReadyAt: null,
+            barAcceptedAt: null,
+            barReadyAt: null,
           };
           this.orders.push(order);
           await this.persist();
@@ -113,10 +117,31 @@ export class OrderBoard {
           if (order.barStatus === "pending") this.notify("bartender", { table: order.table, orderId: order.id });
         }
 
+        if (msg.type === "kitchen_accept") {
+          const order = this.orders.find(o => o.id === msg.orderId);
+          if (order && order.kitchenStatus === "pending") {
+            order.kitchenStatus = "accepted";
+            order.kitchenAcceptedAt = Date.now();
+            await this.persist();
+            this.broadcast();
+          }
+        }
+
+        if (msg.type === "bar_accept") {
+          const order = this.orders.find(o => o.id === msg.orderId);
+          if (order && order.barStatus === "pending") {
+            order.barStatus = "accepted";
+            order.barAcceptedAt = Date.now();
+            await this.persist();
+            this.broadcast();
+          }
+        }
+
         if (msg.type === "kitchen_ready") {
           const order = this.orders.find(o => o.id === msg.orderId);
           if (order) {
             order.kitchenStatus = "ready";
+            order.kitchenReadyAt = Date.now();
             await this.persist();
             this.broadcast();
             this.notify("waiter", { table: order.table, orderId: order.id, part: "kitchen" });
@@ -127,6 +152,7 @@ export class OrderBoard {
           const order = this.orders.find(o => o.id === msg.orderId);
           if (order) {
             order.barStatus = "ready";
+            order.barReadyAt = Date.now();
             await this.persist();
             this.broadcast();
             this.notify("waiter", { table: order.table, orderId: order.id, part: "bar" });
