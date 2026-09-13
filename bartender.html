@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
+<title>GO pub — Бар</title>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#101E2A; --bg-deep:#0A141C; --panel:#17293A; --line:#254257;
+    --gold:#3FA9E0; --cream:#E8F3FA; --muted:#7FA0B8; --green:#4CAF7D; --red:#D9534F;
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
+  html,body{margin:0;padding:0;}
+  body{ background:var(--bg); color:var(--cream); font-family:'Inter',sans-serif; min-height:100vh; }
+  header{ position:sticky; top:0; z-index:20; background:var(--bg-deep); border-bottom:1px solid var(--line); padding:16px 18px; }
+  header h1{ font-family:'Fraunces',serif; font-size:20px; margin:0 0 2px; }
+  header .conn{ font-size:11px; color:var(--muted); }
+  header .conn.on{ color:var(--green); }
+  header .conn.off{ color:var(--red); }
+
+  main{ padding:16px 18px; max-width:520px; margin:0 auto; }
+  .grid{ display:grid; gap:14px; }
+  .ticket{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px; }
+  .ticket.new{ animation: pulse 1.4s ease-in-out 2; border-color: var(--gold); }
+  @keyframes pulse{ 0%,100%{ box-shadow:0 0 0 rgba(63,169,224,0);} 50%{ box-shadow:0 0 0 8px rgba(63,169,224,.15);} }
+  .ticket .top{ display:flex; justify-content:space-between; align-items:baseline; margin-bottom:10px; }
+  .table-badge{ font-family:'Fraunces',serif; font-weight:700; font-size:22px; color:var(--gold); }
+  .time{ font-size:11px; color:var(--muted); }
+  .line{ font-size:16px; padding:6px 0; border-bottom:1px dashed var(--line); }
+  .line:last-of-type{ border-bottom:none; }
+  .line b{ color:var(--gold); }
+  .done-btn{ margin-top:14px; width:100%; padding:14px; border:none; border-radius:12px; background:var(--green); color:#0E1D17; font-weight:700; font-size:15px; }
+  .accept-btn{ margin-top:14px; width:100%; padding:14px; border:none; border-radius:12px; background:var(--gold); color:var(--bg-deep); font-weight:700; font-size:15px; }
+  .status-row{ display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; }
+  .status-new{ font-size:11px; padding:3px 9px; border-radius:999px; font-weight:700; background:rgba(224,149,74,.2); color:var(--gold); }
+  .timer{ font-family:'Fraunces',serif; font-weight:700; font-size:18px; color:var(--green); }
+  .empty{ color:var(--muted); text-align:center; padding:60px 20px; font-size:15px; }
+
+  .nav-row{ display:flex; gap:8px; margin-bottom:16px; }
+  .nav-row button{ flex:1; padding:11px 0; border-radius:12px; border:1px solid var(--line); background:var(--panel); color:var(--cream); font-weight:600; font-size:13px; position:relative; }
+  .nav-row button .badge-count{ position:absolute; top:-6px; right:-6px; background:var(--red); color:#fff; font-size:10px; font-weight:700; border-radius:999px; min-width:16px; height:16px; display:flex; align-items:center; justify-content:center; padding:0 4px; }
+
+  .tabs{ display:flex; gap:6px; margin-bottom:16px; }
+  .tabs button{ flex:1; padding:9px 0; border-radius:999px; border:1px solid var(--line); background:var(--panel); color:var(--muted); font-weight:600; font-size:13px; }
+  .tabs button.active{ background:var(--gold); border-color:var(--gold); color:var(--bg-deep); }
+
+  .day-header{ font-family:'Fraunces',serif; color:var(--gold); font-size:15px; margin:18px 0 8px; padding-bottom:6px; border-bottom:1px solid var(--line); }
+  .day-header:first-child{ margin-top:0; }
+
+  .sheet{ position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:90; display:none; align-items:flex-end; justify-content:center; }
+  .sheet.open{ display:flex; }
+  .sheet-panel{ width:100%; max-width:520px; background:var(--bg); border-radius:20px 20px 0 0; max-height:85vh; display:flex; flex-direction:column; }
+  .sheet-head{ padding:18px 20px 10px; border-bottom:1px solid var(--line); }
+  .sheet-head h2{ font-family:'Fraunces',serif; font-size:18px; margin:0 0 4px; }
+  .sheet-head p{ font-size:12px; color:var(--muted); margin:0; }
+  .sheet-body{ overflow-y:auto; padding:10px 20px; flex:1; }
+  .sheet-cat{ font-family:'Fraunces',serif; color:var(--gold); font-size:14px; margin:14px 0 6px; }
+  .pick-item{ padding:10px 0; border-bottom:1px solid var(--line); }
+  .pick-row{ display:flex; align-items:center; justify-content:space-between; cursor:pointer; }
+  .pick-row .name{ font-size:14px; }
+  .pick-row .check{ width:20px; height:20px; border-radius:6px; border:1.5px solid var(--line); flex-shrink:0; }
+  .pick-item.selected .check{ background:var(--gold); border-color:var(--gold); }
+  .pick-comment{ display:none; margin-top:8px; width:100%; padding:9px 10px; border-radius:8px; border:1px solid var(--line); background:var(--bg-deep); color:var(--cream); font-size:13px; }
+  .pick-item.selected .pick-comment{ display:block; }
+  .pick-existing{ font-size:11.5px; color:var(--muted); margin-top:3px; }
+  .sheet-actions{ display:flex; gap:10px; padding:16px 20px; border-top:1px solid var(--line); }
+  .sheet-actions button{ flex:1; padding:13px; border-radius:12px; font-weight:700; border:none; }
+  .sheet-actions .cancel{ background:transparent; border:1px solid var(--line); color:var(--cream); }
+  .sheet-actions .confirm{ background:var(--gold); color:var(--bg-deep); }
+
+  .lock{ position:fixed; inset:0; background:var(--bg-deep); z-index:100; display:flex; align-items:center; justify-content:center; padding:20px; }
+  .lock-box{ width:100%; max-width:300px; text-align:center; }
+  .lock-box h2{ font-family:'Fraunces',serif; color:var(--cream); margin-bottom:6px; }
+  .lock-box p{ color:var(--muted); font-size:13px; margin-bottom:18px; }
+  .lock-box input{ width:100%; text-align:center; font-size:24px; letter-spacing:8px; padding:14px; border-radius:12px; border:1px solid var(--line); background:var(--panel); color:var(--cream); margin-bottom:12px; }
+  .lock-box button{ width:100%; padding:13px; border:none; border-radius:12px; background:var(--gold); color:var(--bg-deep); font-weight:700; font-size:15px; }
+  .lock-box .err{ color:var(--red); font-size:12.5px; margin-top:10px; min-height:16px; }
+</style>
+</head>
+<body>
+
+<div class="lock" id="lock">
+  <div class="lock-box">
+    <h2>GO pub · Бар</h2>
+    <p id="lockMsg">Введите PIN-код бармена</p>
+    <input id="pinInput" type="password" inputmode="numeric" maxlength="6" placeholder="••••">
+    <button id="pinBtn" onclick="tryPin()">Войти</button>
+    <div class="err" id="pinErr"></div>
+  </div>
+</div>
+
+<div class="lock" id="nameLock" style="display:none">
+  <div class="lock-box">
+    <h2>Как вас зовут?</h2>
+    <p>Ваше имя увидят официант и менеджер</p>
+    <input id="nameInput" type="text" maxlength="30" placeholder="Иван" style="letter-spacing:normal; font-size:18px; text-align:left; padding:14px 16px;">
+    <button onclick="submitName()">Сохранить</button>
+  </div>
+</div>
+
+<header>
+  <h1>GO pub · Бар <span id="staffNameTag" onclick="openNamePrompt()" style="color:var(--gold); font-weight:600; cursor:pointer; text-decoration:underline dotted;"></span></h1>
+  <div class="conn off" id="conn">подключение…</div>
+  <div style="margin-top:4px;"><a href="#" onclick="openNamePrompt();return false;" style="font-size:11px;color:var(--muted);text-decoration:none;">Изменить имя</a> · <a href="#" onclick="openPinPrompt();return false;" style="font-size:11px;color:var(--muted);text-decoration:none;">Сменить PIN</a></div>
+</header>
+
+<main>
+  <div class="nav-row">
+    <button onclick="openDisableSheet()">Убрать из меню</button>
+    <button onclick="openEnableSheet()">Вернуть в меню<span class="badge-count" id="unavailCount" style="display:none">0</span></button>
+  </div>
+  <div class="tabs">
+    <button class="active" onclick="setBoardMode('active')">Заказы</button>
+    <button onclick="setBoardMode('history')">История</button>
+  </div>
+  <div class="grid" id="board"></div>
+  <div id="historyView" style="display:none"></div>
+</main>
+
+<div class="sheet" id="disableSheet">
+  <div class="sheet-panel">
+    <div class="sheet-head"><h2>Убрать из меню</h2><p>Отметьте позиции, которые сейчас нельзя приготовить, и укажите причину</p></div>
+    <div class="sheet-body" id="disableBody"></div>
+    <div class="sheet-actions">
+      <button class="cancel" onclick="closeSheet('disableSheet')">Отмена</button>
+      <button class="confirm" onclick="confirmDisable()">Подтвердить</button>
+    </div>
+  </div>
+</div>
+
+<div class="sheet" id="enableSheet">
+  <div class="sheet-panel">
+    <div class="sheet-head"><h2>Вернуть в меню</h2><p>Отметьте позиции, которые снова можно готовить</p></div>
+    <div class="sheet-body" id="enableBody"></div>
+    <div class="sheet-actions">
+      <button class="cancel" onclick="closeSheet('enableSheet')">Отмена</button>
+      <button class="confirm" onclick="confirmEnable()">Подтвердить</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const WS_URL = "wss://go-pub-orders.kuatov-party.workers.dev/ws";
+const ROLE = "bartender";
+let socket, allOrders = [], newIds = new Set();
+let allHistory = [];
+let boardMode = 'active';
+let staffId = null;
+let staffName = "";
+let unavailable = {};
+let pickerSelection = {}; // name -> comment (for disable sheet)
+let enableSelection = new Set(); // names selected to restore
+
+const BAR_MENU = [
+    { title:"Бутылочное пиво", items:[["Heineken 0.5","2 250"],["Corona Extra 0.35L","3 550"],["Krusovice Svetle 0.45L","1 590"],["Krusovice Cerne 0.45L","1 590"]]},
+    { title:"Разливное пиво (0.5л)", items:[["Пражское","1 450"],["Баварское нефильтрованное","1 750"],["Budweiser Budvar","3 590"],["Guinness","3 990"]]},
+    { title:"Закуски к пиву", items:[["Арахис соленый","1 690"],["Чечил","1 990"],["Чипсы","2 190"],["Фисташки соленые","2 390"],["Курт","1 990"]]},
+    { title:"Водка (50мл)", items:[["Хортица","950"],["Absolut Blue","1 950"],["Tito's","2 790"],["Grey Goose","3 700"],["Belvedere","4 100"]]},
+    { title:"Виски (50мл)", items:[["Ballantine's","2 350"],["Jameson","2 600"],["Jack Daniels","3 500"],["Chivas 12 y.o.","4 100"]]},
+    { title:"Коктейли", items:[["Aperol Spritz","3 190"],["Gin Tonic","2 790"],["Long Island","3 290"],["Cuba Libre","2 590"],["Mimosa","2 490"],["Mojito","2 690"]]},
+    { title:"Безалкогольные", items:[["Coca-Cola","1 990"],["Минеральная вода","1 150"],["Сок","2 390"],["Red Bull","2 450"],["Лимонады","2 790"]]},
+    { title:"Чай/Кофе", items:[["Чай в ассортименте","800"],["Jacobs кофе","1 300"]]},
+];
+const DEST = "bar";
+
+(function initStaffId(){
+  const url = new URL(window.location.href);
+  const fromUrl = url.searchParams.get('staff');
+  if(fromUrl){
+    localStorage.setItem('gopub_staff_id_'+ROLE, fromUrl);
+    url.searchParams.delete('staff');
+    window.history.replaceState({}, '', url.pathname + url.search);
+  }
+  staffId = localStorage.getItem('gopub_staff_id_'+ROLE);
+})();
+
+function getPin(){ return sessionStorage.getItem("gopub_pin_"+ROLE); }
+function setPin(p){ sessionStorage.setItem("gopub_pin_"+ROLE, p); }
+function tryPin(){
+  const p = document.getElementById('pinInput').value.trim();
+  if(!p) return;
+  setPin(p);
+  document.getElementById('pinErr').textContent = "";
+  connect();
+}
+function showLock(err){
+  if(staffId){
+    document.getElementById('lockMsg').textContent = "Не удалось подтвердить это устройство. Попросите менеджера прислать новую QR-ссылку.";
+    document.getElementById('pinInput').style.display = 'none';
+    document.getElementById('pinBtn').style.display = 'none';
+  }
+  document.getElementById('lock').style.display = 'flex';
+  document.getElementById('pinErr').textContent = err || "";
+  document.getElementById('pinInput').value = "";
+}
+function hideLock(){ document.getElementById('lock').style.display = 'none'; }
+function showNameLock(){
+  document.getElementById('nameInput').value = staffName || "";
+  document.getElementById('nameLock').style.display = 'flex';
+}
+function hideNameLock(){ document.getElementById('nameLock').style.display = 'none'; }
+function openNamePrompt(){ showNameLock(); }
+function submitName(){
+  const name = document.getElementById('nameInput').value.trim();
+  if(!name) return;
+  staffName = name;
+  if(staffId){
+    socket.send(JSON.stringify({type:"set_staff_name", staffId, name}));
+  } else {
+    localStorage.setItem('gopub_display_name_'+ROLE, name);
+    socket.send(JSON.stringify({type:"set_display_name", name}));
+  }
+  hideNameLock();
+  updateStaffNameTag();
+}
+function updateStaffNameTag(){
+  document.getElementById('staffNameTag').textContent = staffName ? "— " + staffName : "— указать имя";
+}
+
+let lastPinAttempt = null;
+function openPinPrompt(){
+  const p1 = prompt("Новый PIN для входа (4-6 цифр):");
+  if(p1 === null) return;
+  const clean = p1.trim();
+  if(!/^\d{4,6}$/.test(clean)){ alert("PIN должен состоять из 4-6 цифр"); return; }
+  lastPinAttempt = clean;
+  socket.send(JSON.stringify({type:"change_pin", role:ROLE, newPin:clean}));
+}
+
+function connect(){
+  const pin = staffId ? null : getPin();
+  if(!staffId && !pin){ showLock(); return; }
+  socket = new WebSocket(WS_URL);
+  socket.onopen = () => {
+    setConn(true);
+    const payload = {type:"hello", role:ROLE};
+    if(staffId) payload.staffId = staffId; else payload.pin = pin;
+    socket.send(JSON.stringify(payload));
+  };
+  socket.onclose = () => { setConn(false); setTimeout(connect, 2000); };
+  socket.onerror = () => socket.close();
+  socket.onmessage = (evt) => {
+    const msg = JSON.parse(evt.data);
+    if(msg.type === "auth_ok"){
+      hideLock();
+      if(!staffId){
+        const cached = localStorage.getItem('gopub_display_name_'+ROLE);
+        if(cached){ staffName = cached; socket.send(JSON.stringify({type:"set_display_name", name:cached})); updateStaffNameTag(); }
+        else updateStaffNameTag();
+      }
+    }
+    if(msg.type === "auth_error"){
+      if(!staffId) sessionStorage.removeItem("gopub_pin_"+ROLE);
+      showLock(staffId ? "" : "Неверный PIN");
+    }
+    if(msg.type === "pin_changed"){
+      if(!staffId) setPin(lastPinAttempt);
+      alert("PIN обновлён. Запомните новый PIN — он понадобится при следующем входе.");
+    }
+    if(msg.type === "pin_change_error"){ alert("Не удалось изменить PIN — используйте 4-6 цифр."); }
+    if(msg.type === "state"){
+      allOrders = msg.orders;
+      allHistory = msg.history || [];
+      unavailable = msg.unavailable || {};
+      updateUnavailBadge();
+      if(staffId){
+        const me = (msg.staff || []).find(s => s.id === staffId);
+        if(me){
+          staffName = me.name || "";
+          updateStaffNameTag();
+          if(!staffName) showNameLock(); else hideNameLock();
+        }
+      }
+      render();
+      if(boardMode === 'history') renderHistory();
+    }
+    if(msg.type === "notify"){ ding(msg); }
+  };
+}
+function setConn(on){
+  const el = document.getElementById('conn');
+  el.textContent = on ? "в сети" : "нет связи — переподключение…";
+  el.className = "conn " + (on?"on":"off");
+}
+function ding(msg){
+  if(msg.cancelled) return;
+  try{ new Audio("data:audio/wav;base64,UklGRhwAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=").play(); }catch(e){}
+  if(navigator.vibrate) navigator.vibrate([250,100,250,100,250]);
+  if("Notification" in window && Notification.permission === "granted"){
+    new Notification("Новый заказ — стол " + msg.table);
+  }
+  newIds.add(msg.orderId);
+}
+
+function render(){
+  const el = document.getElementById('board');
+  const active = allOrders.filter(o => o.barStatus === "pending" || o.barStatus === "accepted");
+  if(active.length===0){ el.innerHTML = `<div class="empty">Новых заказов нет 🍸</div>`; return; }
+  let html = "";
+  active.slice().sort((a,b)=>a.createdAt-b.createdAt).forEach(o => {
+    const isNew = newIds.has(o.id);
+    html += `<div class="ticket ${isNew?'new':''}">
+      <div class="top"><span class="table-badge">Стол ${o.table}</span><span class="time">${timeAgo(o.createdAt)}</span></div>`;
+    if(o.waiterName) html += `<div class="line" style="font-size:12px;color:var(--muted);border-bottom:none;padding:0 0 6px;">Официант: ${o.waiterName}</div>`;
+    o.barItems.forEach(i => html += `<div class="line"><b>${i.qty}×</b> ${i.name}${i.note?` <span style="color:var(--gold);font-size:13px;">— ${i.note}</span>`:''}</div>`);
+    if(o.barStatus === "pending"){
+      html += `<div class="status-row"><span class="status-new">Новый</span></div>
+        <button class="accept-btn" onclick="acceptBarOrder('${o.id}')">Принять в работу</button>`;
+    } else {
+      html += `<div class="status-row"><span>Готовится</span><span class="timer" data-since="${o.barAcceptedAt}">00:00</span></div>
+        <button class="done-btn" onclick="markBarReady('${o.id}')">Готово</button>`;
+    }
+    html += `</div>`;
+  });
+  el.innerHTML = html;
+  newIds.clear();
+}
+function timeAgo(ts){
+  const m = Math.floor((Date.now()-ts)/60000);
+  return m<1 ? "только что" : m+" мин назад";
+}
+function cssSafe(s){ return s.replace(/[^a-zA-Zа-яА-Я0-9]/g,'_'); }
+
+function setBoardMode(m){
+  boardMode = m;
+  document.querySelectorAll('.tabs button').forEach((b,i)=>b.classList.toggle('active', (i===0)===(m==='active')));
+  document.getElementById('board').style.display = m==='active' ? '' : 'none';
+  document.getElementById('historyView').style.display = m==='history' ? '' : 'none';
+  if(m==='history') renderHistory();
+}
+
+function dayLabel(ts){
+  const d = new Date(ts);
+  const today = new Date();
+  const yesterday = new Date(); yesterday.setDate(today.getDate()-1);
+  if(d.toDateString()===today.toDateString()) return "Сегодня";
+  if(d.toDateString()===yesterday.toDateString()) return "Вчера";
+  return d.toLocaleDateString('ru-RU', {day:'numeric', month:'long', year:'numeric'});
+}
+
+function renderHistory(){
+  const el = document.getElementById('historyView');
+  const mine = allHistory.filter(o => o.bartenderName === staffName && o.barItems.length>0).sort((a,b)=>b.servedAt-a.servedAt);
+  if(mine.length===0){ el.innerHTML = `<div class="empty">Пока нет приготовленных заказов</div>`; return; }
+  let html = "";
+  let lastDay = null;
+  mine.forEach(o => {
+    const day = dayLabel(o.servedAt);
+    if(day !== lastDay){ html += `<div class="day-header">${day}</div>`; lastDay = day; }
+    html += `<div class="ticket">
+      <div class="top"><span class="table-badge">Стол ${o.table}</span><span class="time">${new Date(o.servedAt).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'})}</span></div>`;
+    o.barItems.forEach(i => html += `<div class="line">${i.qty}× ${i.name}${i.note?` <span style="color:var(--gold);">— ${i.note}</span>`:''}</div>`);
+    html += `</div>`;
+  });
+  el.innerHTML = html;
+}
+function tickTimers(){
+  document.querySelectorAll('.timer[data-since]').forEach(el => {
+    const since = parseInt(el.dataset.since, 10);
+    const s = Math.max(0, Math.floor((Date.now()-since)/1000));
+    const mm = String(Math.floor(s/60)).padStart(2,'0');
+    const ss = String(s%60).padStart(2,'0');
+    el.textContent = mm+":"+ss;
+  });
+}
+function acceptBarOrder(id){ socket.send(JSON.stringify({type:"bar_accept", orderId:id})); }
+function markBarReady(id){ socket.send(JSON.stringify({type:"bar_ready", orderId:id})); }
+
+function updateUnavailBadge(){
+  const count = Object.keys(unavailable).filter(k => k.startsWith(DEST+"|")).length;
+  const el = document.getElementById('unavailCount');
+  if(count>0){ el.style.display='flex'; el.textContent = count; } else { el.style.display='none'; }
+}
+
+function closeSheet(id){ document.getElementById(id).classList.remove('open'); }
+
+function openDisableSheet(){
+  pickerSelection = {};
+  const body = document.getElementById('disableBody');
+  let html = "";
+  BAR_MENU.forEach(cat => {
+    const avail = cat.items.filter(([name]) => !unavailable[DEST+"|"+name]);
+    if(avail.length===0) return;
+    html += `<div class="sheet-cat">${cat.title}</div>`;
+    avail.forEach(([name]) => {
+      const safe = name.replace(/'/g,"\\'");
+      html += `<div class="pick-item" id="dis-${cssSafe(name)}">
+        <div class="pick-row" onclick="togglePick('${safe}')">
+          <span class="name">${name}</span>
+          <span class="check"></span>
+        </div>
+        <input class="pick-comment" placeholder="Причина (например: нет мяса)" oninput="pickerSelection['${safe}']=this.value">
+      </div>`;
+    });
+  });
+  body.innerHTML = html || `<div class="empty">Все позиции уже доступны</div>`;
+  document.getElementById('disableSheet').classList.add('open');
+}
+function togglePick(name){
+  const el = document.getElementById('dis-'+cssSafe(name));
+  if(name in pickerSelection){ delete pickerSelection[name]; el.classList.remove('selected'); }
+  else { pickerSelection[name] = ""; el.classList.add('selected'); }
+}
+function confirmDisable(){
+  const items = Object.keys(pickerSelection).map(name => ({name, comment: pickerSelection[name] || ""}));
+  if(items.length===0){ closeSheet('disableSheet'); return; }
+  socket.send(JSON.stringify({type:"disable_items", items}));
+  closeSheet('disableSheet');
+}
+
+function openEnableSheet(){
+  enableSelection = new Set();
+  const body = document.getElementById('enableBody');
+  const keys = Object.keys(unavailable).filter(k => k.startsWith(DEST+"|"));
+  if(keys.length===0){ body.innerHTML = `<div class="empty">Недоступных позиций нет</div>`; document.getElementById('enableSheet').classList.add('open'); return; }
+  let html = "";
+  keys.forEach(key => {
+    const name = key.slice(DEST.length+1);
+    const info = unavailable[key];
+    const safe = name.replace(/'/g,"\\'");
+    html += `<div class="pick-item" id="en-${cssSafe(name)}">
+      <div class="pick-row" onclick="toggleEnable('${safe}')">
+        <span class="name">${name}</span>
+        <span class="check"></span>
+      </div>
+      ${info && info.comment ? `<div class="pick-existing">Причина: ${info.comment}</div>` : ''}
+    </div>`;
+  });
+  body.innerHTML = html;
+  document.getElementById('enableSheet').classList.add('open');
+}
+function toggleEnable(name){
+  const el = document.getElementById('en-'+cssSafe(name));
+  if(enableSelection.has(name)){ enableSelection.delete(name); el.classList.remove('selected'); }
+  else { enableSelection.add(name); el.classList.add('selected'); }
+}
+function confirmEnable(){
+  const names = Array.from(enableSelection);
+  if(names.length===0){ closeSheet('enableSheet'); return; }
+  socket.send(JSON.stringify({type:"enable_items", names}));
+  closeSheet('enableSheet');
+}
+
+if("Notification" in window && Notification.permission==="default") Notification.requestPermission();
+connect();
+setInterval(render, 30000);
+setInterval(tickTimers, 1000);
+</script>
+</body>
+</html>
