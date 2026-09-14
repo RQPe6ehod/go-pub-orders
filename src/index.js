@@ -224,10 +224,44 @@ export class OrderBoard {
     };
   }
 
+  // What a guest (the public customer menu, no login) is allowed to see —
+  // just the menu and availability, never other tables' orders, staff
+  // names, or revenue.
+  guestSnapshot() {
+    return {
+      type: "state",
+      menu: this.menu,
+      unavailable: this.unavailable,
+      vapidPublicKey: this.env.VAPID_PUBLIC_KEY || null,
+    };
+  }
+
+  computeTableBill(table) {
+    const session = this.openTables[table];
+    if (!session) return { hasOrders: false, items: [], subtotal: 0, service: 0, total: 0 };
+    const rounds = this.history.filter(h => h.table === table && h.servedAt >= session.openedAt);
+    const activeOrders = this.orders.filter(o => o.table === table);
+    const merged = {};
+    const addItems = (items) => {
+      (items || []).forEach(i => {
+        const key = i.name;
+        if (!merged[key]) merged[key] = { name: i.name, qty: 0, price: i.price };
+        merged[key].qty += i.qty;
+      });
+    };
+    rounds.forEach(r => { addItems(r.kitchenItems); addItems(r.barItems); });
+    activeOrders.forEach(o => { addItems(o.kitchenItems); addItems(o.barItems); });
+    const items = Object.values(merged);
+    const subtotal = items.reduce((s, i) => s + parsePrice(i.price) * i.qty, 0);
+    const service = Math.round(subtotal * SERVICE_RATE);
+    return { hasOrders: items.length > 0, items, subtotal, service, total: subtotal + service };
+  }
+
   broadcast() {
-    const payload = JSON.stringify(this.stateSnapshot());
+    const fullPayload = JSON.stringify(this.stateSnapshot());
+    const guestPayload = JSON.stringify(this.guestSnapshot());
     for (const client of this.sockets) {
-      try { client.ws.send(payload); } catch (e) { /* ignore dead sockets */ }
+      try { client.ws.send(client.role === "guest" ? guestPayload : fullPayload); } catch (e) { /* ignore dead sockets */ }
     }
   }
 
@@ -243,6 +277,8 @@ export class OrderBoard {
 
   pushText(message) {
     if (message.kind === "low_stock") return { title: "GO pub — заканчивается", body: `${message.name} — осталось ${message.qty}` };
+    if (message.kind === "call_waiter") return { title: "GO pub — зовут официанта", body: `Стол ${message.table}` };
+    if (message.kind === "request_bill") return { title: "GO pub — просят счёт", body: `Стол ${message.table}` };
     if (message.part) return { title: "GO pub — готово", body: `Стол ${message.table} (${message.part === "kitchen" ? "кухня" : "бар"})` };
     if (message.table !== undefined) return { title: "GO pub — новый заказ", body: `Стол ${message.table}` };
     return { title: "GO pub", body: "Новое уведомление" };
@@ -343,7 +379,7 @@ export class OrderBoard {
             conn.authed = true;
           }
           server.send(JSON.stringify({ type: "auth_ok" }));
-          server.send(JSON.stringify(this.stateSnapshot()));
+          server.send(JSON.stringify(conn.role === "guest" ? this.guestSnapshot() : this.stateSnapshot()));
           return;
         }
 
@@ -358,6 +394,20 @@ export class OrderBoard {
         }
 
         if (!conn.authed) return; // ignore everything until hello succeeds
+
+        if (msg.type === "get_table_bill" && msg.table) {
+          this.sendTo(conn, { type: "table_bill", table: msg.table, ...this.computeTableBill(msg.table) });
+        }
+
+        if (msg.type === "call_waiter" && msg.table) {
+          this.notify("waiter", { kind: "call_waiter", table: msg.table });
+          this.log(conn, "call_waiter", { table: msg.table });
+        }
+
+        if (msg.type === "request_bill" && msg.table) {
+          this.notify("waiter", { kind: "request_bill", table: msg.table });
+          this.log(conn, "request_bill", { table: msg.table });
+        }
 
         if (msg.type === "register_push" && msg.pushId && msg.subscription) {
           this.pushSubs = this.pushSubs.filter(p => p.id !== msg.pushId);
