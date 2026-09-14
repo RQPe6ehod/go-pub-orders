@@ -141,32 +141,37 @@ export class OrderBoard {
     this.openTables = {};
     this.closedTables = [];
     this.staff = [];       // [{id, role, name}]
-    this.tableCount = 20;
+    this.rooms = [{ id: "default", name: "Зал", tableCount: 20 }]; // [{id, name, tableCount}]
     this.unavailable = {}; // key "kitchen|Name" or "bar|Name" -> {comment, disabledBy, disabledAt}
     this.pins = { waiter: "1111", cook: "1111", bartender: "1111", manager: "1111" };
     this.inventory = { kitchen: {}, bar: {} }; // dest -> { "Name": {qty, threshold} }
     this.pushSubs = []; // [{id, role, staffId, subscription}]
+    this.actionLog = []; // [{ts, role, staffName, action, details}]
     this.ready = this.state.blockConcurrencyWhile(async () => {
       const storedOrders = await this.state.storage.get("orders");
       const storedHistory = await this.state.storage.get("history");
       const storedOpen = await this.state.storage.get("openTables");
       const storedClosed = await this.state.storage.get("closedTables");
       const storedStaff = await this.state.storage.get("staff");
-      const storedTableCount = await this.state.storage.get("tableCount");
+      const storedRooms = await this.state.storage.get("rooms");
+      const storedTableCount = await this.state.storage.get("tableCount"); // legacy, pre-rooms
       const storedUnavailable = await this.state.storage.get("unavailable");
       const storedPins = await this.state.storage.get("pins");
       const storedInventory = await this.state.storage.get("inventory");
       const storedPushSubs = await this.state.storage.get("pushSubs");
+      const storedActionLog = await this.state.storage.get("actionLog");
       if (storedOrders) this.orders = storedOrders;
       if (storedHistory) this.history = storedHistory;
       if (storedOpen) this.openTables = storedOpen;
       if (storedClosed) this.closedTables = storedClosed;
       if (storedStaff) this.staff = storedStaff;
-      if (storedTableCount) this.tableCount = storedTableCount;
+      if (storedRooms) this.rooms = storedRooms;
+      else if (storedTableCount) this.rooms = [{ id: "default", name: "Зал", tableCount: storedTableCount }];
       if (storedUnavailable) this.unavailable = storedUnavailable;
       if (storedPins) this.pins = storedPins;
       if (storedInventory) this.inventory = storedInventory;
       if (storedPushSubs) this.pushSubs = storedPushSubs;
+      if (storedActionLog) this.actionLog = storedActionLog;
     });
   }
 
@@ -176,11 +181,23 @@ export class OrderBoard {
     await this.state.storage.put("openTables", this.openTables);
     await this.state.storage.put("closedTables", this.closedTables);
     await this.state.storage.put("staff", this.staff);
-    await this.state.storage.put("tableCount", this.tableCount);
+    await this.state.storage.put("rooms", this.rooms);
     await this.state.storage.put("unavailable", this.unavailable);
     await this.state.storage.put("pins", this.pins);
     await this.state.storage.put("inventory", this.inventory);
     await this.state.storage.put("pushSubs", this.pushSubs);
+    await this.state.storage.put("actionLog", this.actionLog);
+  }
+
+  log(conn, action, details) {
+    this.actionLog.push({
+      ts: Date.now(),
+      role: conn.role || null,
+      staffName: conn.staffName || null,
+      action,
+      details: details || {},
+    });
+    if (this.actionLog.length > 1000) this.actionLog = this.actionLog.slice(-1000);
   }
 
   stateSnapshot() {
@@ -191,9 +208,11 @@ export class OrderBoard {
       openTables: this.openTables,
       closedTables: this.closedTables,
       staff: this.staff,
-      tableCount: this.tableCount,
+      rooms: this.rooms,
+      tableCount: this.rooms.reduce((s, r) => s + (r.tableCount || 0), 0), // kept for any old client still reading it
       unavailable: this.unavailable,
       inventory: this.inventory,
+      actionLog: this.actionLog,
       vapidPublicKey: this.env.VAPID_PUBLIC_KEY || null,
     };
   }
@@ -343,6 +362,7 @@ export class OrderBoard {
           if (staff && conn.staffId === msg.staffId) {
             staff.name = String(msg.name || "").slice(0, 40);
             conn.staffName = staff.name;
+            this.log(conn, "set_name", { name: staff.name });
             await this.persist();
             this.broadcast();
           }
@@ -359,6 +379,7 @@ export class OrderBoard {
           const newPin = String(msg.newPin || "").trim();
           if (newPin.length >= 4 && newPin.length <= 6 && /^\d+$/.test(newPin)) {
             this.pins[msg.role] = newPin;
+            this.log(conn, "change_pin", { role: msg.role });
             await this.persist();
             this.sendTo(conn, { type: "pin_changed", role: msg.role });
           } else {
@@ -369,12 +390,15 @@ export class OrderBoard {
         if (msg.type === "create_staff" && conn.role === "manager") {
           const staff = { id: crypto.randomUUID(), role: msg.role, name: "" };
           this.staff.push(staff);
+          this.log(conn, "create_staff", { role: msg.role });
           await this.persist();
           this.broadcast();
         }
 
         if (msg.type === "delete_staff" && conn.role === "manager") {
+          const staff = this.staff.find(s => s.id === msg.staffId);
           this.staff = this.staff.filter(s => s.id !== msg.staffId);
+          this.log(conn, "delete_staff", { role: staff ? staff.role : null, name: staff ? staff.name : null });
           await this.persist();
           this.broadcast();
         }
@@ -383,15 +407,39 @@ export class OrderBoard {
           const staff = this.staff.find(s => s.id === msg.staffId);
           if (staff) {
             staff.id = crypto.randomUUID(); // old device's cached id stops matching anyone
+            this.log(conn, "reassign_staff", { role: staff.role, name: staff.name });
             await this.persist();
             this.broadcast();
           }
         }
 
-        if (msg.type === "set_table_count" && conn.role === "manager") {
-          const n = parseInt(msg.count, 10);
-          if (n && n > 0 && n <= 200) {
-            this.tableCount = n;
+        if (msg.type === "create_room" && conn.role === "manager") {
+          const room = { id: crypto.randomUUID(), name: String(msg.name || "Зал").slice(0, 40), tableCount: 10 };
+          this.rooms.push(room);
+          this.log(conn, "create_room", { name: room.name });
+          await this.persist();
+          this.broadcast();
+        }
+
+        if (msg.type === "update_room" && conn.role === "manager") {
+          const room = this.rooms.find(r => r.id === msg.roomId);
+          if (room) {
+            if (msg.name !== undefined) room.name = String(msg.name).slice(0, 40) || room.name;
+            if (msg.tableCount !== undefined) {
+              const n = parseInt(msg.tableCount, 10);
+              if (n && n > 0 && n <= 200) room.tableCount = n;
+            }
+            this.log(conn, "update_room", { name: room.name, tableCount: room.tableCount });
+            await this.persist();
+            this.broadcast();
+          }
+        }
+
+        if (msg.type === "delete_room" && conn.role === "manager") {
+          if (this.rooms.length > 1) {
+            const room = this.rooms.find(r => r.id === msg.roomId);
+            this.rooms = this.rooms.filter(r => r.id !== msg.roomId);
+            this.log(conn, "delete_room", { name: room ? room.name : null });
             await this.persist();
             this.broadcast();
           }
@@ -406,6 +454,7 @@ export class OrderBoard {
               disabledAt: Date.now(),
             };
           });
+          this.log(conn, "disable_items", { dest, names: (msg.items || []).map(i => i.name) });
           await this.persist();
           this.broadcast();
           this.notify("manager", { kind: "menu_disabled", dest, names: (msg.items || []).map(i => i.name) });
@@ -414,6 +463,7 @@ export class OrderBoard {
         if (msg.type === "enable_items" && (conn.role === "cook" || conn.role === "bartender")) {
           const dest = conn.role === "cook" ? "kitchen" : "bar";
           (msg.names || []).forEach(name => { delete this.unavailable[dest + "|" + name]; });
+          this.log(conn, "enable_items", { dest, names: msg.names || [] });
           await this.persist();
           this.broadcast();
         }
@@ -423,6 +473,7 @@ export class OrderBoard {
           const qty = Math.max(0, parseInt(msg.qty, 10) || 0);
           const threshold = Math.max(0, parseInt(msg.threshold, 10) || 0);
           this.inventory[dest][msg.name] = { qty, threshold };
+          this.log(conn, "set_stock", { dest, name: msg.name, qty, threshold });
           await this.persist();
           this.broadcast();
         }
@@ -430,6 +481,7 @@ export class OrderBoard {
         if (msg.type === "clear_stock" && (conn.role === "cook" || conn.role === "bartender")) {
           const dest = conn.role === "cook" ? "kitchen" : "bar";
           delete this.inventory[dest][msg.name];
+          this.log(conn, "clear_stock", { dest, name: msg.name });
           await this.persist();
           this.broadcast();
         }
@@ -467,6 +519,7 @@ export class OrderBoard {
             bartenderName: null,
           };
           this.orders.push(order);
+          this.log(conn, "new_order", { table, kitchenCount: kitchenItems.length, barCount: barItems.length });
           await this.persist();
           this.broadcast();
           if (order.kitchenStatus === "pending") this.notify("cook", { table: order.table, orderId: order.id });
@@ -480,6 +533,7 @@ export class OrderBoard {
             order.kitchenStatus = "accepted";
             order.kitchenAcceptedAt = Date.now();
             order.cookName = conn.staffName || "";
+            this.log(conn, "kitchen_accept", { table: order.table });
             await this.persist();
             this.broadcast();
           }
@@ -491,6 +545,7 @@ export class OrderBoard {
             order.barStatus = "accepted";
             order.barAcceptedAt = Date.now();
             order.bartenderName = conn.staffName || "";
+            this.log(conn, "bar_accept", { table: order.table });
             await this.persist();
             this.broadcast();
           }
@@ -502,6 +557,7 @@ export class OrderBoard {
             order.kitchenStatus = "ready";
             order.kitchenReadyAt = Date.now();
             this.consumeStock("kitchen", order.kitchenItems, "cook");
+            this.log(conn, "kitchen_ready", { table: order.table });
             await this.persist();
             this.broadcast();
             this.notify("waiter", { table: order.table, orderId: order.id, part: "kitchen" });
@@ -514,6 +570,7 @@ export class OrderBoard {
             order.barStatus = "ready";
             order.barReadyAt = Date.now();
             this.consumeStock("bar", order.barItems, "bartender");
+            this.log(conn, "bar_ready", { table: order.table });
             await this.persist();
             this.broadcast();
             this.notify("waiter", { table: order.table, orderId: order.id, part: "bar" });
@@ -523,6 +580,7 @@ export class OrderBoard {
         if (msg.type === "cancel_order") {
           const order = this.orders.find(o => o.id === msg.orderId);
           this.orders = this.orders.filter(o => o.id !== msg.orderId);
+          if (order) this.log(conn, "cancel_order", { table: order.table });
           await this.persist();
           this.broadcast();
           if (order) {
@@ -539,6 +597,7 @@ export class OrderBoard {
             order.total = lineTotal(order.kitchenItems) + lineTotal(order.barItems);
             this.history.push(order);
             if (this.history.length > HISTORY_LIMIT) this.history = this.history.slice(-HISTORY_LIMIT);
+            this.log(conn, "served", { table: order.table });
           }
           await this.persist();
           this.broadcast();
@@ -591,6 +650,7 @@ export class OrderBoard {
           delete this.openTables[table];
           this.closedTables.push(receipt);
           if (this.closedTables.length > CLOSED_TABLES_LIMIT) this.closedTables = this.closedTables.slice(-CLOSED_TABLES_LIMIT);
+          this.log(conn, "close_table", { table, total });
 
           await this.persist();
           this.broadcast();
