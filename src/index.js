@@ -151,6 +151,7 @@ export class OrderBoard {
     this.actionLog = []; // [{ts, role, staffName, action, details}]
     this.menu = DEFAULT_MENU; // { kitchen: [...], bar: [...] } — categories/items carry stable ids
     this.qrAssignments = {}; // qrId -> global table number, set by the manager after scanning a printed QR
+    this.cancelRequests = []; // [{id, orderId, table, requestedBy, requestedAt}] — pending manager approval
     this.ready = this.state.blockConcurrencyWhile(async () => {
       const storedOrders = await this.state.storage.get("orders");
       const storedHistory = await this.state.storage.get("history");
@@ -166,6 +167,7 @@ export class OrderBoard {
       const storedActionLog = await this.state.storage.get("actionLog");
       const storedMenu = await this.state.storage.get("menu");
       const storedQrAssignments = await this.state.storage.get("qrAssignments");
+      const storedCancelRequests = await this.state.storage.get("cancelRequests");
       if (storedOrders) this.orders = storedOrders;
       if (storedHistory) this.history = storedHistory;
       if (storedOpen) this.openTables = storedOpen;
@@ -180,6 +182,7 @@ export class OrderBoard {
       if (storedActionLog) this.actionLog = storedActionLog;
       if (storedMenu) this.menu = storedMenu;
       if (storedQrAssignments) this.qrAssignments = storedQrAssignments;
+      if (storedCancelRequests) this.cancelRequests = storedCancelRequests;
     });
   }
 
@@ -197,6 +200,7 @@ export class OrderBoard {
     await this.state.storage.put("actionLog", this.actionLog);
     await this.state.storage.put("menu", this.menu);
     await this.state.storage.put("qrAssignments", this.qrAssignments);
+    await this.state.storage.put("cancelRequests", this.cancelRequests);
   }
 
   log(conn, action, details) {
@@ -225,6 +229,7 @@ export class OrderBoard {
       actionLog: this.actionLog,
       menu: this.menu,
       qrAssignments: this.qrAssignments,
+      cancelRequests: this.cancelRequests,
       vapidPublicKey: this.env.VAPID_PUBLIC_KEY || null,
     };
   }
@@ -284,6 +289,9 @@ export class OrderBoard {
     if (message.kind === "low_stock") return { title: "GO pub — заканчивается", body: `${message.name} — осталось ${message.qty}` };
     if (message.kind === "call_waiter") return { title: "GO pub — зовут официанта", body: `Стол ${message.table}` };
     if (message.kind === "request_bill") return { title: "GO pub — просят счёт", body: `Стол ${message.table}` };
+    if (message.kind === "cancel_request") return { title: "GO pub — запрос на отмену", body: `Стол ${message.table} — подтвердите или отклоните` };
+    if (message.kind === "cancel_approved") return { title: "GO pub — отмена подтверждена", body: `Стол ${message.table}` };
+    if (message.kind === "cancel_rejected") return { title: "GO pub — в отмене отказано", body: `Стол ${message.table}` };
     if (message.part) return { title: "GO pub — готово", body: `Стол ${message.table} (${message.part === "kitchen" ? "кухня" : "бар"})` };
     if (message.table !== undefined) return { title: "GO pub — новый заказ", body: `Стол ${message.table}` };
     return { title: "GO pub", body: "Новое уведомление" };
@@ -766,15 +774,51 @@ export class OrderBoard {
           }
         }
 
-        if (msg.type === "cancel_order") {
+        if (msg.type === "request_cancel_order") {
           const order = this.orders.find(o => o.id === msg.orderId);
-          this.orders = this.orders.filter(o => o.id !== msg.orderId);
-          if (order) this.log(conn, "cancel_order", { table: order.table });
-          await this.persist();
-          this.broadcast();
           if (order) {
-            if (order.kitchenItems.length) this.notify("cook", { table: order.table, orderId: order.id, cancelled: true });
-            if (order.barItems.length) this.notify("bartender", { table: order.table, orderId: order.id, cancelled: true });
+            const reqId = crypto.randomUUID();
+            this.cancelRequests.push({
+              id: reqId,
+              orderId: order.id,
+              table: order.table,
+              requestedBy: conn.staffName || "",
+              requestedAt: Date.now(),
+            });
+            this.log(conn, "request_cancel_order", { table: order.table });
+            await this.persist();
+            this.broadcast();
+            this.notify("manager", { kind: "cancel_request", table: order.table, requestId: reqId });
+          }
+        }
+
+        if (msg.type === "approve_cancel" && conn.role === "manager") {
+          const idx = this.cancelRequests.findIndex(r => r.id === msg.requestId);
+          if (idx !== -1) {
+            const req = this.cancelRequests[idx];
+            this.cancelRequests.splice(idx, 1);
+            const order = this.orders.find(o => o.id === req.orderId);
+            this.orders = this.orders.filter(o => o.id !== req.orderId);
+            this.log(conn, "approve_cancel", { table: req.table });
+            await this.persist();
+            this.broadcast();
+            if (order) {
+              if (order.kitchenItems.length) this.notify("cook", { table: order.table, orderId: order.id, cancelled: true });
+              if (order.barItems.length) this.notify("bartender", { table: order.table, orderId: order.id, cancelled: true });
+            }
+            this.notify("waiter", { kind: "cancel_approved", table: req.table });
+          }
+        }
+
+        if (msg.type === "reject_cancel" && conn.role === "manager") {
+          const idx = this.cancelRequests.findIndex(r => r.id === msg.requestId);
+          if (idx !== -1) {
+            const req = this.cancelRequests[idx];
+            this.cancelRequests.splice(idx, 1);
+            this.log(conn, "reject_cancel", { table: req.table });
+            await this.persist();
+            this.broadcast();
+            this.notify("waiter", { kind: "cancel_rejected", table: req.table });
           }
         }
 
