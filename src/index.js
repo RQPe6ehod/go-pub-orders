@@ -361,6 +361,16 @@ export class OrderBoard {
               this.sockets.delete(conn);
               return;
             }
+            if (!staff.pin) { staff.pin = "1111"; await this.persist(); } // migrate older records
+            if (String(msg.pin || "") !== String(staff.pin)) {
+              // Right device, wrong (or missing) personal PIN — this is the
+              // "locked, please unlock" case, distinct from unknown_staff:
+              // the staffId binding on this device stays intact.
+              server.send(JSON.stringify({ type: "auth_error", reason: "wrong_pin" }));
+              server.close(4001, "wrong staff pin");
+              this.sockets.delete(conn);
+              return;
+            }
             conn.role = msg.role;
             conn.staffId = staff.id;
             conn.staffName = staff.name || "";
@@ -443,6 +453,21 @@ export class OrderBoard {
           }
         }
 
+        if (msg.type === "set_staff_pin") {
+          const staff = this.staff.find(s => s.id === msg.staffId);
+          if (staff && conn.staffId === msg.staffId) {
+            const newPin = String(msg.newPin || "").trim();
+            if (/^\d{4,6}$/.test(newPin)) {
+              staff.pin = newPin;
+              this.log(conn, "set_staff_pin", {});
+              await this.persist();
+              this.sendTo(conn, { type: "staff_pin_changed" });
+            } else {
+              this.sendTo(conn, { type: "staff_pin_change_error" });
+            }
+          }
+        }
+
         if (msg.type === "set_display_name" && !conn.staffId) {
           // For connections logged in with the shared role PIN (no personal
           // staff record) — the name only lives on this connection and is
@@ -463,7 +488,7 @@ export class OrderBoard {
         }
 
         if (msg.type === "create_staff" && conn.role === "manager") {
-          const staff = { id: crypto.randomUUID(), role: msg.role, name: "" };
+          const staff = { id: crypto.randomUUID(), role: msg.role, name: "", pin: "1111" };
           this.staff.push(staff);
           this.log(conn, "create_staff", { role: msg.role });
           await this.persist();
