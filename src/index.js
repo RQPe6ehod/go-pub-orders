@@ -150,6 +150,7 @@ export class OrderBoard {
     this.pushSubs = []; // [{id, role, staffId, subscription}]
     this.actionLog = []; // [{ts, role, staffName, action, details}]
     this.menu = DEFAULT_MENU; // { kitchen: [...], bar: [...] } — categories/items carry stable ids
+    this.qrAssignments = {}; // qrId -> global table number, set by the manager after scanning a printed QR
     this.ready = this.state.blockConcurrencyWhile(async () => {
       const storedOrders = await this.state.storage.get("orders");
       const storedHistory = await this.state.storage.get("history");
@@ -164,6 +165,7 @@ export class OrderBoard {
       const storedPushSubs = await this.state.storage.get("pushSubs");
       const storedActionLog = await this.state.storage.get("actionLog");
       const storedMenu = await this.state.storage.get("menu");
+      const storedQrAssignments = await this.state.storage.get("qrAssignments");
       if (storedOrders) this.orders = storedOrders;
       if (storedHistory) this.history = storedHistory;
       if (storedOpen) this.openTables = storedOpen;
@@ -177,6 +179,7 @@ export class OrderBoard {
       if (storedPushSubs) this.pushSubs = storedPushSubs;
       if (storedActionLog) this.actionLog = storedActionLog;
       if (storedMenu) this.menu = storedMenu;
+      if (storedQrAssignments) this.qrAssignments = storedQrAssignments;
     });
   }
 
@@ -193,6 +196,7 @@ export class OrderBoard {
     await this.state.storage.put("pushSubs", this.pushSubs);
     await this.state.storage.put("actionLog", this.actionLog);
     await this.state.storage.put("menu", this.menu);
+    await this.state.storage.put("qrAssignments", this.qrAssignments);
   }
 
   log(conn, action, details) {
@@ -220,6 +224,7 @@ export class OrderBoard {
       inventory: this.inventory,
       actionLog: this.actionLog,
       menu: this.menu,
+      qrAssignments: this.qrAssignments,
       vapidPublicKey: this.env.VAPID_PUBLIC_KEY || null,
     };
   }
@@ -393,6 +398,13 @@ export class OrderBoard {
           return;
         }
 
+        if (msg.type === "resolve_qr") {
+          // Public — a printed table QR only encodes an anonymous id; this
+          // is how the customer menu finds out which table it's sitting at.
+          this.sendTo(conn, { type: "qr_table", qrId: msg.qrId, table: this.qrAssignments[msg.qrId] ?? null });
+          return;
+        }
+
         if (!conn.authed) return; // ignore everything until hello succeeds
 
         if (msg.type === "get_table_bill" && msg.table) {
@@ -506,6 +518,20 @@ export class OrderBoard {
             await this.persist();
             this.broadcast();
           }
+        }
+
+        if (msg.type === "assign_qr" && conn.role === "manager" && msg.qrId && msg.table) {
+          this.qrAssignments[msg.qrId] = parseInt(msg.table, 10);
+          this.log(conn, "assign_qr", { qrId: msg.qrId, table: this.qrAssignments[msg.qrId] });
+          await this.persist();
+          this.broadcast();
+        }
+
+        if (msg.type === "unassign_qr" && conn.role === "manager" && msg.qrId) {
+          delete this.qrAssignments[msg.qrId];
+          this.log(conn, "unassign_qr", { qrId: msg.qrId });
+          await this.persist();
+          this.broadcast();
         }
 
         if (msg.type === "add_menu_category" && conn.role === "manager") {
