@@ -307,7 +307,9 @@ export class OrderBoard {
   }
 
   pushToRole(role, message) {
-    const subs = this.pushSubs.filter(p => p.role === role);
+    const subs = this.pushSubs.filter(p =>
+      p.role === role && (!p.staffId || this.staff.some(s => s.id === p.staffId))
+    ); // staffId-less (manager) always kept; staff roles must still exist in the current roster
     if (subs.length === 0) return;
     const text = this.pushText(message);
     subs.forEach(p => {
@@ -551,6 +553,7 @@ export class OrderBoard {
         if (msg.type === "delete_staff" && conn.role === "manager") {
           const staff = this.staff.find(s => s.id === msg.staffId);
           this.staff = this.staff.filter(s => s.id !== msg.staffId);
+          this.pushSubs = this.pushSubs.filter(p => p.staffId !== msg.staffId); // stop notifying a device once its staff record is gone
           this.log(conn, "delete_staff", { role: staff ? staff.role : null, name: staff ? staff.name : null });
           await this.persist();
           this.broadcast();
@@ -559,6 +562,7 @@ export class OrderBoard {
         if (msg.type === "reassign_staff" && conn.role === "manager") {
           const staff = this.staff.find(s => s.id === msg.staffId);
           if (staff) {
+            this.pushSubs = this.pushSubs.filter(p => p.staffId !== staff.id); // old device's push binding no longer applies once the id rotates
             staff.id = crypto.randomUUID(); // old device's cached id stops matching anyone
             this.log(conn, "reassign_staff", { role: staff.role, name: staff.name });
             await this.persist();
