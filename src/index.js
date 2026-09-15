@@ -292,6 +292,7 @@ export class OrderBoard {
     if (message.kind === "cancel_request") return { title: "GO pub — запрос на отмену", body: `Стол ${message.table} — подтвердите или отклоните` };
     if (message.kind === "cancel_approved") return { title: "GO pub — отмена подтверждена", body: `Стол ${message.table}` };
     if (message.kind === "cancel_rejected") return { title: "GO pub — в отмене отказано", body: `Стол ${message.table}` };
+    if (message.kind === "cancel_already_resolved") return { title: "GO pub", body: `Стол ${message.table} — заказ уже выдан, отменять нечего` };
     if (message.part) return { title: "GO pub — готово", body: `Стол ${message.table} (${message.part === "kitchen" ? "кухня" : "бар"})` };
     if (message.table !== undefined) return { title: "GO pub — новый заказ", body: `Стол ${message.table}` };
     return { title: "GO pub", body: "Новое уведомление" };
@@ -805,8 +806,10 @@ export class OrderBoard {
             if (order) {
               if (order.kitchenItems.length) this.notify("cook", { table: order.table, orderId: order.id, cancelled: true });
               if (order.barItems.length) this.notify("bartender", { table: order.table, orderId: order.id, cancelled: true });
+              this.notify("waiter", { kind: "cancel_approved", table: req.table });
+            } else {
+              this.notify("waiter", { kind: "cancel_already_resolved", table: req.table });
             }
-            this.notify("waiter", { kind: "cancel_approved", table: req.table });
           }
         }
 
@@ -825,6 +828,7 @@ export class OrderBoard {
         if (msg.type === "served") {
           const order = this.orders.find(o => o.id === msg.orderId);
           this.orders = this.orders.filter(o => o.id !== msg.orderId);
+          this.cancelRequests = this.cancelRequests.filter(r => r.orderId !== msg.orderId); // no longer relevant — order is done
           if (order) {
             order.servedAt = Date.now();
             order.total = lineTotal(order.kitchenItems) + lineTotal(order.barItems);
