@@ -294,7 +294,7 @@ export class OrderBoard {
   }
 
   pushText(message, role) {
-    const urlByRole = { waiter: "/waiter.html", cook: "/cook.html", bartender: "/bartender.html", manager: "/manager.html" };
+    const urlByRole = { waiter: "/waiter.html?view=board", cook: "/cook.html", bartender: "/bartender.html", manager: "/manager.html" };
     const url = urlByRole[role] || "/";
     if (message.kind === "low_stock") return { title: "GO pub — заканчивается", body: `${message.name} — осталось ${message.qty}`, url };
     if (message.kind === "call_waiter") return { title: "GO pub — зовут официанта", body: `Стол ${message.table}`, url };
