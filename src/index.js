@@ -152,6 +152,8 @@ export class OrderBoard {
     this.menu = DEFAULT_MENU; // { kitchen: [...], bar: [...] } — categories/items carry stable ids
     this.qrAssignments = {}; // qrId -> global table number, set by the manager after scanning a printed QR
     this.cancelRequests = []; // [{id, orderId, table, requestedBy, requestedAt}] — pending manager approval
+    this.guestHistory = {}; // deviceId -> [{items:[{name,qty}], ts}] — only for guests who explicitly opted in
+    this.tableGuestDevice = {}; // table -> deviceId, only set for devices with prior consent-based history
     this.ready = this.state.blockConcurrencyWhile(async () => {
       const storedOrders = await this.state.storage.get("orders");
       const storedHistory = await this.state.storage.get("history");
@@ -168,6 +170,8 @@ export class OrderBoard {
       const storedMenu = await this.state.storage.get("menu");
       const storedQrAssignments = await this.state.storage.get("qrAssignments");
       const storedCancelRequests = await this.state.storage.get("cancelRequests");
+      const storedGuestHistory = await this.state.storage.get("guestHistory");
+      const storedTableGuestDevice = await this.state.storage.get("tableGuestDevice");
       if (storedOrders) this.orders = storedOrders;
       if (storedHistory) this.history = storedHistory;
       if (storedOpen) this.openTables = storedOpen;
@@ -183,6 +187,8 @@ export class OrderBoard {
       if (storedMenu) this.menu = storedMenu;
       if (storedQrAssignments) this.qrAssignments = storedQrAssignments;
       if (storedCancelRequests) this.cancelRequests = storedCancelRequests;
+      if (storedGuestHistory) this.guestHistory = storedGuestHistory;
+      if (storedTableGuestDevice) this.tableGuestDevice = storedTableGuestDevice;
     });
   }
 
@@ -201,6 +207,8 @@ export class OrderBoard {
     await this.state.storage.put("menu", this.menu);
     await this.state.storage.put("qrAssignments", this.qrAssignments);
     await this.state.storage.put("cancelRequests", this.cancelRequests);
+    await this.state.storage.put("guestHistory", this.guestHistory);
+    await this.state.storage.put("tableGuestDevice", this.tableGuestDevice);
   }
 
   log(conn, action, details) {
@@ -438,6 +446,39 @@ export class OrderBoard {
         if (msg.type === "request_bill" && msg.table) {
           this.notify("waiter", { kind: "request_bill", table: msg.table });
           this.log(conn, "request_bill", { table: msg.table });
+        }
+
+        if (msg.type === "guest_at_table" && msg.deviceId && msg.table) {
+          // Only ever called by a device that has previously opted in — see
+          // save_guest_order below. Lets the waiter look up "usual order".
+          this.tableGuestDevice[msg.table] = msg.deviceId;
+          await this.persist();
+        }
+
+        if (msg.type === "save_guest_order" && msg.deviceId && msg.table) {
+          const bill = this.computeTableBill(msg.table);
+          if (bill.hasOrders) {
+            const entry = { items: bill.items.map(i => ({ name: i.name, qty: i.qty })), ts: Date.now() };
+            const list = this.guestHistory[msg.deviceId] || [];
+            list.push(entry);
+            this.guestHistory[msg.deviceId] = list.slice(-5); // keep the last 5 visits only
+            this.tableGuestDevice[msg.table] = msg.deviceId;
+            await this.persist();
+          }
+        }
+
+        if (msg.type === "forget_guest" && msg.deviceId) {
+          delete this.guestHistory[msg.deviceId];
+          for (const t of Object.keys(this.tableGuestDevice)) {
+            if (this.tableGuestDevice[t] === msg.deviceId) delete this.tableGuestDevice[t];
+          }
+          await this.persist();
+        }
+
+        if (msg.type === "get_guest_history_for_table" && msg.table && (conn.role === "waiter" || conn.role === "manager")) {
+          const deviceId = this.tableGuestDevice[msg.table];
+          const history = deviceId ? (this.guestHistory[deviceId] || []) : [];
+          this.sendTo(conn, { type: "guest_history_result", table: msg.table, history });
         }
 
         if (msg.type === "register_push" && msg.pushId && msg.subscription) {
