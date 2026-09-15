@@ -293,17 +293,19 @@ export class OrderBoard {
     this.pushToRole(role, message);
   }
 
-  pushText(message) {
-    if (message.kind === "low_stock") return { title: "GO pub — заканчивается", body: `${message.name} — осталось ${message.qty}` };
-    if (message.kind === "call_waiter") return { title: "GO pub — зовут официанта", body: `Стол ${message.table}` };
-    if (message.kind === "request_bill") return { title: "GO pub — просят счёт", body: `Стол ${message.table}` };
-    if (message.kind === "cancel_request") return { title: "GO pub — запрос на отмену", body: `Стол ${message.table} — подтвердите или отклоните` };
-    if (message.kind === "cancel_approved") return { title: "GO pub — отмена подтверждена", body: `Стол ${message.table}` };
-    if (message.kind === "cancel_rejected") return { title: "GO pub — в отмене отказано", body: `Стол ${message.table}` };
-    if (message.kind === "cancel_already_resolved") return { title: "GO pub", body: `Стол ${message.table} — заказ уже выдан, отменять нечего` };
-    if (message.part) return { title: "GO pub — готово", body: `Стол ${message.table} (${message.part === "kitchen" ? "кухня" : "бар"})` };
-    if (message.table !== undefined) return { title: "GO pub — новый заказ", body: `Стол ${message.table}` };
-    return { title: "GO pub", body: "Новое уведомление" };
+  pushText(message, role) {
+    const urlByRole = { waiter: "/waiter.html", cook: "/cook.html", bartender: "/bartender.html", manager: "/manager.html" };
+    const url = urlByRole[role] || "/";
+    if (message.kind === "low_stock") return { title: "GO pub — заканчивается", body: `${message.name} — осталось ${message.qty}`, url };
+    if (message.kind === "call_waiter") return { title: "GO pub — зовут официанта", body: `Стол ${message.table}`, url };
+    if (message.kind === "request_bill") return { title: "GO pub — просят счёт", body: `Стол ${message.table}`, url };
+    if (message.kind === "cancel_request") return { title: "GO pub — запрос на отмену", body: `Стол ${message.table} — подтвердите или отклоните`, url };
+    if (message.kind === "cancel_approved") return { title: "GO pub — отмена подтверждена", body: `Стол ${message.table}`, url };
+    if (message.kind === "cancel_rejected") return { title: "GO pub — в отмене отказано", body: `Стол ${message.table}`, url };
+    if (message.kind === "cancel_already_resolved") return { title: "GO pub", body: `Стол ${message.table} — заказ уже выдан, отменять нечего`, url };
+    if (message.part) return { title: "GO pub — готово", body: `Стол ${message.table} (${message.part === "kitchen" ? "кухня" : "бар"})`, url };
+    if (message.table !== undefined) return { title: "GO pub — новый заказ", body: `Стол ${message.table}`, url };
+    return { title: "GO pub", body: "Новое уведомление", url };
   }
 
   pushToRole(role, message) {
@@ -311,7 +313,7 @@ export class OrderBoard {
       p.role === role && (!p.staffId || this.staff.some(s => s.id === p.staffId))
     ); // staffId-less (manager) always kept; staff roles must still exist in the current roster
     if (subs.length === 0) return;
-    const text = this.pushText(message);
+    const text = this.pushText(message, role);
     subs.forEach(p => {
       sendWebPush(p.subscription, text, this.env)
         .then(async (resp) => {
