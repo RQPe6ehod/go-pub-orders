@@ -297,14 +297,14 @@ export class OrderBoard {
     const urlByRole = { waiter: "/waiter.html?view=board", cook: "/cook.html", bartender: "/bartender.html", manager: "/manager.html" };
     const url = urlByRole[role] || "/";
     if (message.kind === "low_stock") return { title: "GO pub — заканчивается", body: `${message.name} — осталось ${message.qty}`, url };
-    if (message.kind === "call_waiter") return { title: "GO pub — зовут официанта", body: `Стол ${message.table}`, url };
-    if (message.kind === "request_bill") return { title: "GO pub — просят счёт", body: `Стол ${message.table}`, url };
-    if (message.kind === "cancel_request") return { title: "GO pub — запрос на отмену", body: `Стол ${message.table} — подтвердите или отклоните`, url };
-    if (message.kind === "cancel_approved") return { title: "GO pub — отмена подтверждена", body: `Стол ${message.table}`, url };
-    if (message.kind === "cancel_rejected") return { title: "GO pub — в отмене отказано", body: `Стол ${message.table}`, url };
-    if (message.kind === "cancel_already_resolved") return { title: "GO pub", body: `Стол ${message.table} — заказ уже выдан, отменять нечего`, url };
-    if (message.part) return { title: "GO pub — готово", body: `Стол ${message.table} (${message.part === "kitchen" ? "кухня" : "бар"})`, url };
-    if (message.table !== undefined) return { title: "GO pub — новый заказ", body: `Стол ${message.table}`, url };
+    if (message.kind === "call_waiter") return { title: "GO pub — зовут официанта", body: `Стол ${this.tableLabel(message.table)}`, url };
+    if (message.kind === "request_bill") return { title: "GO pub — просят счёт", body: `Стол ${this.tableLabel(message.table)}`, url };
+    if (message.kind === "cancel_request") return { title: "GO pub — запрос на отмену", body: `Стол ${this.tableLabel(message.table)} — подтвердите или отклоните`, url };
+    if (message.kind === "cancel_approved") return { title: "GO pub — отмена подтверждена", body: `Стол ${this.tableLabel(message.table)}`, url };
+    if (message.kind === "cancel_rejected") return { title: "GO pub — в отмене отказано", body: `Стол ${this.tableLabel(message.table)}`, url };
+    if (message.kind === "cancel_already_resolved") return { title: "GO pub", body: `Стол ${this.tableLabel(message.table)} — заказ уже выдан, отменять нечего`, url };
+    if (message.part) return { title: "GO pub — готово", body: `Стол ${this.tableLabel(message.table)} (${message.part === "kitchen" ? "кухня" : "бар"})`, url };
+    if (message.table !== undefined) return { title: "GO pub — новый заказ", body: `Стол ${this.tableLabel(message.table)}`, url };
     return { title: "GO pub", body: "Новое уведомление", url };
   }
 
@@ -339,6 +339,16 @@ export class OrderBoard {
         this.notify(notifyRole, { kind: "low_stock", name: i.name, qty: stock.qty });
       }
     });
+  }
+
+  tableLabel(globalNum) {
+    if (this.rooms.length <= 1) return String(globalNum);
+    let offset = 0;
+    for (const room of this.rooms) {
+      if (globalNum <= offset + room.tableCount) return `${room.name} · ${globalNum - offset}`;
+      offset += room.tableCount;
+    }
+    return String(globalNum);
   }
 
   checkPin(role, pin) {
