@@ -128,6 +128,7 @@ async function sendWebPush(subscription, payloadObj, env) {
       "Content-Type": "application/octet-stream",
       "Content-Encoding": "aes128gcm",
       TTL: "60",
+      Urgency: "high", // ask the push service (FCM on Android) to attempt immediate delivery, waking the device from Doze mode rather than deferring until the screen turns on
     },
     body,
   });
@@ -153,6 +154,7 @@ export class OrderBoard {
     this.qrAssignments = {}; // qrId -> global table number, set by the manager after scanning a printed QR
     this.cancelRequests = []; // [{id, orderId, table, requestedBy, requestedAt}] — pending manager approval
     this.pendingEscalations = []; // [{orderId, table, dueAt}] — "still not served after 2 min" checks, tracked via the DO alarm
+    this.pendingBillEscalations = []; // [{table, dueAt}] — "still no reaction to a bill request after 2 min"
     this.callingTables = {}; // table -> true, while a guest has called for a waiter and no waiter has acknowledged it yet
     this.guestHistory = {}; // deviceId -> [{items:[{name,qty}], ts}] — only for guests who explicitly opted in
     this.tableGuestDevice = {}; // table -> deviceId, only set for devices with prior consent-based history
@@ -173,6 +175,7 @@ export class OrderBoard {
       const storedQrAssignments = await this.state.storage.get("qrAssignments");
       const storedCancelRequests = await this.state.storage.get("cancelRequests");
       const storedPendingEscalations = await this.state.storage.get("pendingEscalations");
+      const storedPendingBillEscalations = await this.state.storage.get("pendingBillEscalations");
       const storedCallingTables = await this.state.storage.get("callingTables");
       const storedGuestHistory = await this.state.storage.get("guestHistory");
       const storedTableGuestDevice = await this.state.storage.get("tableGuestDevice");
@@ -192,6 +195,7 @@ export class OrderBoard {
       if (storedQrAssignments) this.qrAssignments = storedQrAssignments;
       if (storedCancelRequests) this.cancelRequests = storedCancelRequests;
       if (storedPendingEscalations) this.pendingEscalations = storedPendingEscalations;
+      if (storedPendingBillEscalations) this.pendingBillEscalations = storedPendingBillEscalations;
       if (storedCallingTables) this.callingTables = storedCallingTables;
       if (storedGuestHistory) this.guestHistory = storedGuestHistory;
       if (storedTableGuestDevice) this.tableGuestDevice = storedTableGuestDevice;
@@ -214,6 +218,7 @@ export class OrderBoard {
     await this.state.storage.put("qrAssignments", this.qrAssignments);
     await this.state.storage.put("cancelRequests", this.cancelRequests);
     await this.state.storage.put("pendingEscalations", this.pendingEscalations);
+    await this.state.storage.put("pendingBillEscalations", this.pendingBillEscalations);
     await this.state.storage.put("callingTables", this.callingTables);
     await this.state.storage.put("guestHistory", this.guestHistory);
     await this.state.storage.put("tableGuestDevice", this.tableGuestDevice);
@@ -321,6 +326,7 @@ export class OrderBoard {
     if (message.kind === "cancel_already_resolved") return { title: "GO pub", body: `Стол ${this.tableLabel(message.table)} — заказ уже выдан, отменять нечего`, url };
     if (message.kind === "still_not_served") return { title: "GO pub — заказ всё ещё не выдан", body: `Стол ${this.tableLabel(message.table)} — прошло 2 минуты с готовности`, url };
     if (message.kind === "still_not_served") return { title: "GO pub — заказ всё ещё не подан", body: `Стол ${this.tableLabel(message.table)} — готово уже 2 минуты`, url };
+    if (message.kind === "still_no_bill") return { title: "GO pub — гость всё ещё ждёт счёт", body: `Стол ${this.tableLabel(message.table)} — просил счёт уже 2 минуты`, url };
     if (message.part) return { title: "GO pub — готово", body: `Стол ${this.tableLabel(message.table)} (${message.part === "kitchen" ? "кухня" : "бар"})`, url };
     if (message.table !== undefined) return { title: "GO pub — новый заказ", body: `Стол ${this.tableLabel(message.table)}`, url };
     return { title: "GO pub", body: "Новое уведомление", url };
@@ -401,11 +407,27 @@ export class OrderBoard {
     });
   }
 
+  async ensureAlarmScheduled() {
+    const dues = [
+      ...this.pendingEscalations.map(e => e.dueAt),
+      ...this.pendingBillEscalations.map(e => e.dueAt),
+    ];
+    if (dues.length > 0) await this.state.storage.setAlarm(Math.min(...dues));
+  }
+
   async scheduleEscalation(orderId, table) {
     this.pendingEscalations.push({ orderId, table, dueAt: Date.now() + 2 * 60 * 1000 });
     await this.persist();
-    const nextDue = Math.min(...this.pendingEscalations.map(e => e.dueAt));
-    await this.state.storage.setAlarm(nextDue);
+    await this.ensureAlarmScheduled();
+  }
+
+  async scheduleBillEscalation(table) {
+    // one pending watch per table is enough — repeated bill requests
+    // shouldn't stack up separate escalation timers
+    if (this.pendingBillEscalations.some(e => e.table === table)) return;
+    this.pendingBillEscalations.push({ table, dueAt: Date.now() + 2 * 60 * 1000 });
+    await this.persist();
+    await this.ensureAlarmScheduled();
   }
 
   async alarm() {
@@ -420,11 +442,17 @@ export class OrderBoard {
         this.notify("manager", { kind: "still_not_served", table: e.table, orderId: e.orderId });
       }
     }
-    await this.persist();
-    if (this.pendingEscalations.length > 0) {
-      const nextDue = Math.min(...this.pendingEscalations.map(x => x.dueAt));
-      await this.state.storage.setAlarm(nextDue);
+    const dueBills = this.pendingBillEscalations.filter(e => e.dueAt <= now);
+    this.pendingBillEscalations = this.pendingBillEscalations.filter(e => e.dueAt > now);
+    for (const e of dueBills) {
+      const stillOpen = !!this.openTables[e.table]; // resolved once the waiter closes the table
+      if (stillOpen) {
+        this.notify("waiter", { kind: "still_no_bill", table: e.table });
+        this.notify("manager", { kind: "still_no_bill", table: e.table });
+      }
     }
+    await this.persist();
+    await this.ensureAlarmScheduled();
   }
 
   checkPin(role, pin) {
@@ -545,8 +573,10 @@ export class OrderBoard {
         }
 
         if (msg.type === "request_bill" && msg.table) {
-          this.notify("waiter", { kind: "request_bill", table: msg.table });
+          const openedBy = this.openTables[msg.table] ? this.openTables[msg.table].openedBy : null;
+          this.notifyStaff(openedBy, { kind: "request_bill", table: msg.table });
           this.log(conn, "request_bill", { table: msg.table });
+          await this.scheduleBillEscalation(msg.table);
         }
 
         if (msg.type === "guest_at_table" && msg.deviceId && msg.table) {
@@ -834,7 +864,7 @@ export class OrderBoard {
         if (msg.type === "new_order") {
           const table = msg.table;
           if (!this.openTables[table]) {
-            this.openTables[table] = { openedAt: Date.now() };
+            this.openTables[table] = { openedAt: Date.now(), openedBy: conn.staffId || null };
           }
 
           const isAvailable = (dest, name) => !this.unavailable[dest + "|" + name];
