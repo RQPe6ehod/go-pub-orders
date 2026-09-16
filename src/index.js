@@ -325,7 +325,6 @@ export class OrderBoard {
     if (message.kind === "cancel_rejected") return { title: "GO pub — в отмене отказано", body: `Стол ${this.tableLabel(message.table)}`, url };
     if (message.kind === "cancel_already_resolved") return { title: "GO pub", body: `Стол ${this.tableLabel(message.table)} — заказ уже выдан, отменять нечего`, url };
     if (message.kind === "still_not_served") return { title: "GO pub — заказ всё ещё не выдан", body: `Стол ${this.tableLabel(message.table)} — прошло 2 минуты с готовности`, url };
-    if (message.kind === "still_not_served") return { title: "GO pub — заказ всё ещё не подан", body: `Стол ${this.tableLabel(message.table)} — готово уже 2 минуты`, url };
     if (message.kind === "still_no_bill") return { title: "GO pub — гость всё ещё ждёт счёт", body: `Стол ${this.tableLabel(message.table)} — просил счёт уже 2 минуты`, url };
     if (message.part) return { title: "GO pub — готово", body: `Стол ${this.tableLabel(message.table)} (${message.part === "kitchen" ? "кухня" : "бар"})`, url };
     if (message.table !== undefined) return { title: "GO pub — новый заказ", body: `Стол ${this.tableLabel(message.table)}`, url };
@@ -574,7 +573,8 @@ export class OrderBoard {
 
         if (msg.type === "request_bill" && msg.table) {
           const openedBy = this.openTables[msg.table] ? this.openTables[msg.table].openedBy : null;
-          this.notifyStaff(openedBy, { kind: "request_bill", table: msg.table });
+          if (openedBy) this.notifyStaff(openedBy, { kind: "request_bill", table: msg.table });
+          else this.notify("waiter", { kind: "request_bill", table: msg.table });
           this.log(conn, "request_bill", { table: msg.table });
           await this.scheduleBillEscalation(msg.table);
         }
