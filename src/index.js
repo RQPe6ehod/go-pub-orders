@@ -152,6 +152,8 @@ export class OrderBoard {
     this.menu = DEFAULT_MENU; // { kitchen: [...], bar: [...] } — categories/items carry stable ids
     this.qrAssignments = {}; // qrId -> global table number, set by the manager after scanning a printed QR
     this.cancelRequests = []; // [{id, orderId, table, requestedBy, requestedAt}] — pending manager approval
+    this.pendingEscalations = []; // [{orderId, table, dueAt}] — "still not served after 2 min" checks, tracked via the DO alarm
+    this.callingTables = {}; // table -> true, while a guest has called for a waiter and no waiter has acknowledged it yet
     this.guestHistory = {}; // deviceId -> [{items:[{name,qty}], ts}] — only for guests who explicitly opted in
     this.tableGuestDevice = {}; // table -> deviceId, only set for devices with prior consent-based history
     this.ready = this.state.blockConcurrencyWhile(async () => {
@@ -170,6 +172,8 @@ export class OrderBoard {
       const storedMenu = await this.state.storage.get("menu");
       const storedQrAssignments = await this.state.storage.get("qrAssignments");
       const storedCancelRequests = await this.state.storage.get("cancelRequests");
+      const storedPendingEscalations = await this.state.storage.get("pendingEscalations");
+      const storedCallingTables = await this.state.storage.get("callingTables");
       const storedGuestHistory = await this.state.storage.get("guestHistory");
       const storedTableGuestDevice = await this.state.storage.get("tableGuestDevice");
       if (storedOrders) this.orders = storedOrders;
@@ -187,6 +191,8 @@ export class OrderBoard {
       if (storedMenu) this.menu = storedMenu;
       if (storedQrAssignments) this.qrAssignments = storedQrAssignments;
       if (storedCancelRequests) this.cancelRequests = storedCancelRequests;
+      if (storedPendingEscalations) this.pendingEscalations = storedPendingEscalations;
+      if (storedCallingTables) this.callingTables = storedCallingTables;
       if (storedGuestHistory) this.guestHistory = storedGuestHistory;
       if (storedTableGuestDevice) this.tableGuestDevice = storedTableGuestDevice;
     });
@@ -207,6 +213,8 @@ export class OrderBoard {
     await this.state.storage.put("menu", this.menu);
     await this.state.storage.put("qrAssignments", this.qrAssignments);
     await this.state.storage.put("cancelRequests", this.cancelRequests);
+    await this.state.storage.put("pendingEscalations", this.pendingEscalations);
+    await this.state.storage.put("callingTables", this.callingTables);
     await this.state.storage.put("guestHistory", this.guestHistory);
     await this.state.storage.put("tableGuestDevice", this.tableGuestDevice);
   }
@@ -238,6 +246,7 @@ export class OrderBoard {
       menu: this.menu,
       qrAssignments: this.qrAssignments,
       cancelRequests: this.cancelRequests,
+      callingTables: this.callingTables,
       vapidPublicKey: this.env.VAPID_PUBLIC_KEY || null,
     };
   }
@@ -256,7 +265,7 @@ export class OrderBoard {
 
   computeTableBill(table) {
     const session = this.openTables[table];
-    if (!session) return { hasOrders: false, items: [], subtotal: 0, service: 0, total: 0 };
+    if (!session) return { hasOrders: false, items: [], subtotal: 0, service: 0, total: 0, status: null };
     const rounds = this.history.filter(h => h.table === table && h.servedAt >= session.openedAt);
     const activeOrders = this.orders.filter(o => o.table === table);
     const merged = {};
@@ -272,7 +281,14 @@ export class OrderBoard {
     const items = Object.values(merged);
     const subtotal = items.reduce((s, i) => s + parsePrice(i.price) * i.qty, 0);
     const service = Math.round(subtotal * SERVICE_RATE);
-    return { hasOrders: items.length > 0, items, subtotal, service, total: subtotal + service };
+
+    let status = null;
+    if (items.length > 0) {
+      if (activeOrders.length === 0) status = "served"; // everything ordered so far has already been served
+      else status = activeOrders.every(o => this.isOrderFullyReady(o)) ? "ready" : "preparing";
+    }
+
+    return { hasOrders: items.length > 0, items, subtotal, service, total: subtotal + service, status };
   }
 
   broadcast() {
@@ -303,6 +319,8 @@ export class OrderBoard {
     if (message.kind === "cancel_approved") return { title: "GO pub — отмена подтверждена", body: `Стол ${this.tableLabel(message.table)}`, url };
     if (message.kind === "cancel_rejected") return { title: "GO pub — в отмене отказано", body: `Стол ${this.tableLabel(message.table)}`, url };
     if (message.kind === "cancel_already_resolved") return { title: "GO pub", body: `Стол ${this.tableLabel(message.table)} — заказ уже выдан, отменять нечего`, url };
+    if (message.kind === "still_not_served") return { title: "GO pub — заказ всё ещё не выдан", body: `Стол ${this.tableLabel(message.table)} — прошло 2 минуты с готовности`, url };
+    if (message.kind === "still_not_served") return { title: "GO pub — заказ всё ещё не подан", body: `Стол ${this.tableLabel(message.table)} — готово уже 2 минуты`, url };
     if (message.part) return { title: "GO pub — готово", body: `Стол ${this.tableLabel(message.table)} (${message.part === "kitchen" ? "кухня" : "бар"})`, url };
     if (message.table !== undefined) return { title: "GO pub — новый заказ", body: `Стол ${this.tableLabel(message.table)}`, url };
     return { title: "GO pub", body: "Новое уведомление", url };
@@ -349,6 +367,64 @@ export class OrderBoard {
       offset += room.tableCount;
     }
     return String(globalNum);
+  }
+
+  isOrderFullyReady(order) {
+    const kReady = order.kitchenStatus === "ready" || order.kitchenStatus === "none";
+    const bReady = order.barStatus === "ready" || order.barStatus === "none";
+    return kReady && bReady;
+  }
+
+  notifyStaff(staffId, message) {
+    // Same as notify(), but targeted at one specific person's device(s)
+    // rather than an entire role — used for "tell the waiter who actually
+    // owns this order" before falling back to the whole team.
+    if (!staffId) return;
+    const payload = JSON.stringify({ type: "notify", ...message });
+    for (const client of this.sockets) {
+      if (client.staffId === staffId) {
+        try { client.ws.send(payload); } catch (e) {}
+      }
+    }
+    const subs = this.pushSubs.filter(p => p.staffId === staffId);
+    if (subs.length === 0) return;
+    const text = this.pushText(message, "waiter");
+    subs.forEach(p => {
+      sendWebPush(p.subscription, text, this.env)
+        .then(async (resp) => {
+          if (resp && (resp.status === 404 || resp.status === 410)) {
+            this.pushSubs = this.pushSubs.filter(x => x.id !== p.id);
+            await this.persist();
+          }
+        })
+        .catch(() => {});
+    });
+  }
+
+  async scheduleEscalation(orderId, table) {
+    this.pendingEscalations.push({ orderId, table, dueAt: Date.now() + 2 * 60 * 1000 });
+    await this.persist();
+    const nextDue = Math.min(...this.pendingEscalations.map(e => e.dueAt));
+    await this.state.storage.setAlarm(nextDue);
+  }
+
+  async alarm() {
+    await this.ready;
+    const now = Date.now();
+    const due = this.pendingEscalations.filter(e => e.dueAt <= now);
+    this.pendingEscalations = this.pendingEscalations.filter(e => e.dueAt > now);
+    for (const e of due) {
+      const stillWaiting = this.orders.find(o => o.id === e.orderId);
+      if (stillWaiting) {
+        this.notify("waiter", { kind: "still_not_served", table: e.table, orderId: e.orderId });
+        this.notify("manager", { kind: "still_not_served", table: e.table, orderId: e.orderId });
+      }
+    }
+    await this.persist();
+    if (this.pendingEscalations.length > 0) {
+      const nextDue = Math.min(...this.pendingEscalations.map(x => x.dueAt));
+      await this.state.storage.setAlarm(nextDue);
+    }
   }
 
   checkPin(role, pin) {
@@ -453,8 +529,19 @@ export class OrderBoard {
         }
 
         if (msg.type === "call_waiter" && msg.table) {
+          this.callingTables[msg.table] = true;
           this.notify("waiter", { kind: "call_waiter", table: msg.table });
           this.log(conn, "call_waiter", { table: msg.table });
+          await this.persist();
+          this.broadcast();
+        }
+
+        if (msg.type === "acknowledge_call" && msg.table && conn.role === "waiter") {
+          if (this.callingTables[msg.table]) {
+            delete this.callingTables[msg.table];
+            await this.persist();
+            this.broadcast();
+          }
         }
 
         if (msg.type === "request_bill" && msg.table) {
@@ -765,6 +852,7 @@ export class OrderBoard {
             table,
             createdAt: Date.now(),
             waiterName: conn.staffName || "",
+            waiterId: conn.staffId || null,
             kitchenItems,
             barItems,
             kitchenStatus: kitchenItems.length ? "pending" : "none",
@@ -812,26 +900,44 @@ export class OrderBoard {
         if (msg.type === "kitchen_ready") {
           const order = this.orders.find(o => o.id === msg.orderId);
           if (order) {
+            const wasFullyReady = this.isOrderFullyReady(order);
             order.kitchenStatus = "ready";
             order.kitchenReadyAt = Date.now();
             this.consumeStock("kitchen", order.kitchenItems, "cook");
             this.log(conn, "kitchen_ready", { table: order.table });
+            const nowFullyReady = this.isOrderFullyReady(order);
+            if (nowFullyReady && !wasFullyReady) {
+              order.fullyReadyAt = Date.now();
+              if (order.waiterId) this.notifyStaff(order.waiterId, { table: order.table, orderId: order.id, part: "kitchen" });
+              else this.notify("waiter", { table: order.table, orderId: order.id, part: "kitchen" });
+              await this.scheduleEscalation(order.id, order.table);
+            } else {
+              this.notify("waiter", { table: order.table, orderId: order.id, part: "kitchen" });
+            }
             await this.persist();
             this.broadcast();
-            this.notify("waiter", { table: order.table, orderId: order.id, part: "kitchen" });
           }
         }
 
         if (msg.type === "bar_ready") {
           const order = this.orders.find(o => o.id === msg.orderId);
           if (order) {
+            const wasFullyReady = this.isOrderFullyReady(order);
             order.barStatus = "ready";
             order.barReadyAt = Date.now();
             this.consumeStock("bar", order.barItems, "bartender");
             this.log(conn, "bar_ready", { table: order.table });
+            const nowFullyReady = this.isOrderFullyReady(order);
+            if (nowFullyReady && !wasFullyReady) {
+              order.fullyReadyAt = Date.now();
+              if (order.waiterId) this.notifyStaff(order.waiterId, { table: order.table, orderId: order.id, part: "bar" });
+              else this.notify("waiter", { table: order.table, orderId: order.id, part: "bar" });
+              await this.scheduleEscalation(order.id, order.table);
+            } else {
+              this.notify("waiter", { table: order.table, orderId: order.id, part: "bar" });
+            }
             await this.persist();
             this.broadcast();
-            this.notify("waiter", { table: order.table, orderId: order.id, part: "bar" });
           }
         }
 
