@@ -98,6 +98,35 @@ async function encryptWebPushPayload(payloadBytes, p256dhB64url, authB64url) {
   return concatBytes(header, ciphertext);
 }
 
+async function hmacHex(text, secret) {
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(text));
+  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 20); // 80-bit truncation — plenty for this, keeps the QR payload short
+}
+
+async function signQrId(secret) {
+  // A fresh table QR is "<random uuid>.<hmac of that uuid>" — the signature
+  // can only be produced by someone holding QR_SIGNING_SECRET (us), so a QR
+  // printed/generated anywhere else can never pass verifyQrId below, even if
+  // its uuid portion happens to collide or look plausible.
+  const uuid = crypto.randomUUID();
+  const sig = await hmacHex(uuid, secret);
+  return `${uuid}.${sig}`;
+}
+
+async function verifyQrId(qrId, secret) {
+  if (!qrId || typeof qrId !== "string") return false;
+  const dot = qrId.lastIndexOf(".");
+  if (dot < 1) return false;
+  const uuid = qrId.slice(0, dot);
+  const sig = qrId.slice(dot + 1);
+  const expected = await hmacHex(uuid, secret);
+  return sig === expected;
+}
+
 async function buildVapidAuthHeader(endpoint, subject, publicKeyB64url, privateKeyPkcs8B64) {
   const aud = new URL(endpoint).origin;
   const header = { typ: "JWT", alg: "ES256" };
@@ -566,7 +595,8 @@ export class OrderBoard {
         if (msg.type === "resolve_qr") {
           // Public — a printed table QR only encodes an anonymous id; this
           // is how the customer menu finds out which table it's sitting at.
-          this.sendTo(conn, { type: "qr_table", qrId: msg.qrId, table: this.qrAssignments[msg.qrId] ?? null });
+          const valid = await verifyQrId(msg.qrId, this.env.QR_SIGNING_SECRET);
+          this.sendTo(conn, { type: "qr_table", qrId: msg.qrId, table: valid ? (this.qrAssignments[msg.qrId] ?? null) : null });
           return;
         }
 
@@ -763,10 +793,23 @@ export class OrderBoard {
         }
 
         if (msg.type === "assign_qr" && conn.role === "manager" && msg.qrId && msg.table) {
+          const valid = await verifyQrId(msg.qrId, this.env.QR_SIGNING_SECRET);
+          if (!valid) {
+            this.sendTo(conn, { type: "qr_assign_error", reason: "not_ours" });
+            return;
+          }
           this.qrAssignments[msg.qrId] = parseInt(msg.table, 10);
           this.log(conn, "assign_qr", { qrId: msg.qrId, table: this.qrAssignments[msg.qrId] });
           await this.persist();
           this.broadcast();
+        }
+
+        if (msg.type === "generate_qr" && conn.role === "manager") {
+          // Mints a brand-new table QR id, signed with our secret, so the
+          // manager can produce additional table QR codes from the app
+          // itself without needing a fresh batch generated externally.
+          const qrId = await signQrId(this.env.QR_SIGNING_SECRET);
+          this.sendTo(conn, { type: "qr_generated", qrId });
         }
 
         if (msg.type === "unassign_qr" && conn.role === "manager" && msg.qrId) {
