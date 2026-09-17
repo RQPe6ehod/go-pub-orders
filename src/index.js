@@ -156,6 +156,8 @@ export class OrderBoard {
     this.pendingEscalations = []; // [{orderId, table, dueAt}] — "still not served after 2 min" checks, tracked via the DO alarm
     this.pendingBillEscalations = []; // [{table, dueAt}] — "still no reaction to a bill request after 2 min"
     this.callingTables = {}; // table -> true, while a guest has called for a waiter and no waiter has acknowledged it yet
+    this.billRequestedTables = {}; // table -> true, while a guest has asked for the bill and no waiter has acknowledged it yet
+    this.returningGuestTables = {}; // table -> true, while a recognized repeat guest is present and no waiter has acknowledged it yet
     this.guestHistory = {}; // deviceId -> [{items:[{name,qty}], ts}] — only for guests who explicitly opted in
     this.tableGuestDevice = {}; // table -> deviceId, only set for devices with prior consent-based history
     this.ready = this.state.blockConcurrencyWhile(async () => {
@@ -177,6 +179,8 @@ export class OrderBoard {
       const storedPendingEscalations = await this.state.storage.get("pendingEscalations");
       const storedPendingBillEscalations = await this.state.storage.get("pendingBillEscalations");
       const storedCallingTables = await this.state.storage.get("callingTables");
+      const storedBillRequestedTables = await this.state.storage.get("billRequestedTables");
+      const storedReturningGuestTables = await this.state.storage.get("returningGuestTables");
       const storedGuestHistory = await this.state.storage.get("guestHistory");
       const storedTableGuestDevice = await this.state.storage.get("tableGuestDevice");
       if (storedOrders) this.orders = storedOrders;
@@ -197,6 +201,8 @@ export class OrderBoard {
       if (storedPendingEscalations) this.pendingEscalations = storedPendingEscalations;
       if (storedPendingBillEscalations) this.pendingBillEscalations = storedPendingBillEscalations;
       if (storedCallingTables) this.callingTables = storedCallingTables;
+      if (storedBillRequestedTables) this.billRequestedTables = storedBillRequestedTables;
+      if (storedReturningGuestTables) this.returningGuestTables = storedReturningGuestTables;
       if (storedGuestHistory) this.guestHistory = storedGuestHistory;
       if (storedTableGuestDevice) this.tableGuestDevice = storedTableGuestDevice;
     });
@@ -220,6 +226,8 @@ export class OrderBoard {
     await this.state.storage.put("pendingEscalations", this.pendingEscalations);
     await this.state.storage.put("pendingBillEscalations", this.pendingBillEscalations);
     await this.state.storage.put("callingTables", this.callingTables);
+    await this.state.storage.put("billRequestedTables", this.billRequestedTables);
+    await this.state.storage.put("returningGuestTables", this.returningGuestTables);
     await this.state.storage.put("guestHistory", this.guestHistory);
     await this.state.storage.put("tableGuestDevice", this.tableGuestDevice);
   }
@@ -252,6 +260,8 @@ export class OrderBoard {
       qrAssignments: this.qrAssignments,
       cancelRequests: this.cancelRequests,
       callingTables: this.callingTables,
+      billRequestedTables: this.billRequestedTables,
+      returningGuestTables: this.returningGuestTables,
       vapidPublicKey: this.env.VAPID_PUBLIC_KEY || null,
     };
   }
@@ -316,7 +326,8 @@ export class OrderBoard {
 
   pushText(message, role) {
     const urlByRole = { waiter: "/waiter.html?view=board", cook: "/cook.html", bartender: "/bartender.html", manager: "/manager.html" };
-    const url = urlByRole[role] || "/";
+    let url = urlByRole[role] || "/";
+    if (role === "waiter" && message.table !== undefined) url += "&table=" + encodeURIComponent(message.table);
     if (message.kind === "low_stock") return { title: "GO pub — заканчивается", body: `${message.name} — осталось ${message.qty}`, url };
     if (message.kind === "call_waiter") return { title: "GO pub — зовут официанта", body: `Стол ${this.tableLabel(message.table)}`, url };
     if (message.kind === "request_bill") return { title: "GO pub — просят счёт", body: `Стол ${this.tableLabel(message.table)}`, url };
@@ -563,27 +574,37 @@ export class OrderBoard {
           this.broadcast();
         }
 
-        if (msg.type === "acknowledge_call" && msg.table && conn.role === "waiter") {
-          if (this.callingTables[msg.table]) {
-            delete this.callingTables[msg.table];
-            await this.persist();
-            this.broadcast();
-          }
+        if (msg.type === "acknowledge_table" && msg.table && conn.role === "waiter") {
+          let changed = false;
+          if (this.callingTables[msg.table]) { delete this.callingTables[msg.table]; changed = true; }
+          if (this.billRequestedTables[msg.table]) { delete this.billRequestedTables[msg.table]; changed = true; }
+          if (this.returningGuestTables[msg.table]) { delete this.returningGuestTables[msg.table]; changed = true; }
+          const before = this.pendingBillEscalations.length;
+          this.pendingBillEscalations = this.pendingBillEscalations.filter(e => e.table !== msg.table);
+          if (this.pendingBillEscalations.length !== before) changed = true;
+          if (changed) { await this.persist(); this.broadcast(); }
         }
 
         if (msg.type === "request_bill" && msg.table) {
+          this.billRequestedTables[msg.table] = true;
           const openedBy = this.openTables[msg.table] ? this.openTables[msg.table].openedBy : null;
           if (openedBy) this.notifyStaff(openedBy, { kind: "request_bill", table: msg.table });
           else this.notify("waiter", { kind: "request_bill", table: msg.table });
           this.log(conn, "request_bill", { table: msg.table });
           await this.scheduleBillEscalation(msg.table);
+          await this.persist();
+          this.broadcast();
         }
 
         if (msg.type === "guest_at_table" && msg.deviceId && msg.table) {
           // Only ever called by a device that has previously opted in — see
           // save_guest_order below. Lets the waiter look up "usual order".
           this.tableGuestDevice[msg.table] = msg.deviceId;
+          if ((this.guestHistory[msg.deviceId] || []).length > 0) {
+            this.returningGuestTables[msg.table] = true; // only true repeat visitors light up the table — not first-time consenters
+          }
           await this.persist();
+          this.broadcast();
         }
 
         if (msg.type === "save_guest_order" && msg.deviceId && msg.table) {
@@ -1081,6 +1102,9 @@ export class OrderBoard {
           };
 
           delete this.openTables[table];
+          delete this.billRequestedTables[table];
+          delete this.returningGuestTables[table];
+          this.pendingBillEscalations = this.pendingBillEscalations.filter(e => e.table !== table);
           this.closedTables.push(receipt);
           if (this.closedTables.length > CLOSED_TABLES_LIMIT) this.closedTables = this.closedTables.slice(-CLOSED_TABLES_LIMIT);
           this.log(conn, "close_table", { table, total });
