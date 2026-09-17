@@ -391,6 +391,15 @@ export class OrderBoard {
     return kReady && bReady;
   }
 
+  notifyGuestAtTable(table, message) {
+    const payload = JSON.stringify(message);
+    for (const client of this.sockets) {
+      if (client.role === "guest" && client.table === table) {
+        try { client.ws.send(payload); } catch (e) {}
+      }
+    }
+  }
+
   notifyStaff(staffId, message) {
     // Same as notify(), but targeted at one specific person's device(s)
     // rather than an entire role — used for "tell the waiter who actually
@@ -498,6 +507,7 @@ export class OrderBoard {
             // the role-gated write branches below.
             conn.role = "guest";
             conn.authed = true;
+            conn.table = msg.table || null; // lets us notify this specific guest directly (e.g. when their table is closed)
           } else if (msg.staffId) {
             const staff = this.staff.find(s => s.id === msg.staffId && s.role === msg.role);
             if (!staff) {
@@ -585,7 +595,7 @@ export class OrderBoard {
           if (changed) { await this.persist(); this.broadcast(); }
         }
 
-        if (msg.type === "request_bill" && msg.table) {
+        if (msg.type === "request_bill" && msg.table && this.openTables[msg.table]) {
           this.billRequestedTables[msg.table] = true;
           const openedBy = this.openTables[msg.table] ? this.openTables[msg.table].openedBy : null;
           if (openedBy) this.notifyStaff(openedBy, { kind: "request_bill", table: msg.table });
@@ -1112,6 +1122,7 @@ export class OrderBoard {
           await this.persist();
           this.broadcast();
           this.sendTo(conn, { type: "table_closed", receipt });
+          this.notifyGuestAtTable(table, { type: "table_closed" });
         }
       });
 
