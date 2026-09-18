@@ -857,6 +857,8 @@ export class OrderBoard {
               name: { ru: String(msg.name || "Новая позиция").slice(0, 60) },
               price: String(msg.price || "0").slice(0, 20),
             };
+            if (msg.price2) item.price2 = String(msg.price2).slice(0, 20);
+            if (msg.price3) item.price3 = String(msg.price3).slice(0, 20);
             if (msg.desc) item.desc = { ru: String(msg.desc).slice(0, 200) };
             cat.items.push(item);
             this.log(conn, "add_menu_item", { dest, name: item.name.ru });
@@ -872,6 +874,14 @@ export class OrderBoard {
           if (item) {
             if (msg.name !== undefined) item.name.ru = String(msg.name).slice(0, 60) || item.name.ru;
             if (msg.price !== undefined) item.price = String(msg.price).slice(0, 20) || item.price;
+            if (msg.price2 !== undefined) {
+              if (msg.price2) item.price2 = String(msg.price2).slice(0, 20);
+              else delete item.price2; // empty means "back to a single price"
+            }
+            if (msg.price3 !== undefined) {
+              if (msg.price3) item.price3 = String(msg.price3).slice(0, 20);
+              else delete item.price3;
+            }
             if (msg.desc !== undefined) {
               if (msg.desc) { item.desc = item.desc || {}; item.desc.ru = String(msg.desc).slice(0, 200); }
               else delete item.desc;
