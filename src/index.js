@@ -187,6 +187,7 @@ export class OrderBoard {
     this.callingTables = {}; // table -> true, while a guest has called for a waiter and no waiter has acknowledged it yet
     this.billRequestedTables = {}; // table -> true, while a guest has asked for the bill and no waiter has acknowledged it yet
     this.returningGuestTables = {}; // table -> true, while a recognized repeat guest is present and no waiter has acknowledged it yet
+    this.repeatRequests = []; // [{id, table, items, requestedAt}] — guest-initiated "repeat my order" asks, pending a waiter's confirmation before becoming a real order
     this.guestHistory = {}; // deviceId -> [{items:[{name,qty}], ts}] — only for guests who explicitly opted in
     this.tableGuestDevice = {}; // table -> deviceId, only set for devices with prior consent-based history
     this.ready = this.state.blockConcurrencyWhile(async () => {
@@ -210,6 +211,7 @@ export class OrderBoard {
       const storedCallingTables = await this.state.storage.get("callingTables");
       const storedBillRequestedTables = await this.state.storage.get("billRequestedTables");
       const storedReturningGuestTables = await this.state.storage.get("returningGuestTables");
+      const storedRepeatRequests = await this.state.storage.get("repeatRequests");
       const storedGuestHistory = await this.state.storage.get("guestHistory");
       const storedTableGuestDevice = await this.state.storage.get("tableGuestDevice");
       if (storedOrders) this.orders = storedOrders;
@@ -232,6 +234,7 @@ export class OrderBoard {
       if (storedCallingTables) this.callingTables = storedCallingTables;
       if (storedBillRequestedTables) this.billRequestedTables = storedBillRequestedTables;
       if (storedReturningGuestTables) this.returningGuestTables = storedReturningGuestTables;
+      if (storedRepeatRequests) this.repeatRequests = storedRepeatRequests;
       if (storedGuestHistory) this.guestHistory = storedGuestHistory;
       if (storedTableGuestDevice) this.tableGuestDevice = storedTableGuestDevice;
 
@@ -273,6 +276,7 @@ export class OrderBoard {
     await this.state.storage.put("callingTables", this.callingTables);
     await this.state.storage.put("billRequestedTables", this.billRequestedTables);
     await this.state.storage.put("returningGuestTables", this.returningGuestTables);
+    await this.state.storage.put("repeatRequests", this.repeatRequests);
     await this.state.storage.put("guestHistory", this.guestHistory);
     await this.state.storage.put("tableGuestDevice", this.tableGuestDevice);
   }
@@ -307,6 +311,7 @@ export class OrderBoard {
       callingTables: this.callingTables,
       billRequestedTables: this.billRequestedTables,
       returningGuestTables: this.returningGuestTables,
+      repeatRequests: this.repeatRequests,
       vapidPublicKey: this.env.VAPID_PUBLIC_KEY || null,
     };
   }
@@ -329,15 +334,15 @@ export class OrderBoard {
     const rounds = this.history.filter(h => h.table === table && h.servedAt >= session.openedAt);
     const activeOrders = this.orders.filter(o => o.table === table);
     const merged = {};
-    const addItems = (items) => {
+    const addItems = (items, dest) => {
       (items || []).forEach(i => {
         const key = i.name;
-        if (!merged[key]) merged[key] = { name: i.name, qty: 0, price: i.price };
+        if (!merged[key]) merged[key] = { name: i.name, qty: 0, price: i.price, dest };
         merged[key].qty += i.qty;
       });
     };
-    rounds.forEach(r => { addItems(r.kitchenItems); addItems(r.barItems); });
-    activeOrders.forEach(o => { addItems(o.kitchenItems); addItems(o.barItems); });
+    rounds.forEach(r => { addItems(r.kitchenItems, "kitchen"); addItems(r.barItems, "bar"); });
+    activeOrders.forEach(o => { addItems(o.kitchenItems, "kitchen"); addItems(o.barItems, "bar"); });
     const items = Object.values(merged);
     const subtotal = items.reduce((s, i) => s + parsePrice(i.price) * i.qty, 0);
     const service = Math.round(subtotal * SERVICE_RATE);
@@ -375,6 +380,11 @@ export class OrderBoard {
     if (role === "waiter" && message.table !== undefined) url += "&table=" + encodeURIComponent(message.table);
     if (message.kind === "low_stock") return { title: "GO pub — заканчивается", body: `${message.name} — осталось ${message.qty}`, url };
     if (message.kind === "call_waiter") return { title: "GO pub — зовут официанта", body: `Стол ${this.tableLabel(message.table)}`, url };
+    if (message.kind === "quick_request") {
+      const labels = { cutlery: "просит приборы", napkins: "просит салфетки", toothpicks: "просит зубочистки", salt_pepper: "просит соль/перец", order_problem: "сообщает о проблеме с заказом" };
+      return { title: "GO pub — запрос от стола", body: `Стол ${this.tableLabel(message.table)} ${labels[message.what] || "что-то просит"}`, url };
+    }
+    if (message.kind === "repeat_request") return { title: "GO pub — повторный заказ", body: `Стол ${this.tableLabel(message.table)} хочет повторить заказ — проверьте и подтвердите`, url };
     if (message.kind === "request_bill") return { title: "GO pub — просят счёт", body: `Стол ${this.tableLabel(message.table)}`, url };
     if (message.kind === "cancel_request") return { title: "GO pub — запрос на отмену", body: `Стол ${this.tableLabel(message.table)} — подтвердите или отклоните`, url };
     if (message.kind === "cancel_approved") return { title: "GO pub — отмена подтверждена", body: `Стол ${this.tableLabel(message.table)}`, url };
@@ -623,6 +633,33 @@ export class OrderBoard {
           this.broadcast();
         }
 
+        if (msg.type === "guest_quick_request" && msg.table && msg.what) {
+          const validWhats = ["cutlery", "napkins", "toothpicks", "salt_pepper", "order_problem"];
+          if (!validWhats.includes(msg.what)) return;
+          const openedBy = this.openTables[msg.table] ? this.openTables[msg.table].openedBy : null;
+          const payload = { kind: "quick_request", what: msg.what, table: msg.table };
+          if (openedBy) this.notifyStaff(openedBy, payload);
+          else this.notify("waiter", payload);
+          this.log(conn, "guest_quick_request", { table: msg.table, what: msg.what });
+        }
+
+        if (msg.type === "guest_repeat_request" && msg.table && Array.isArray(msg.items) && msg.items.length) {
+          const items = msg.items
+            .filter(i => i && typeof i.name === "string" && (i.dest === "kitchen" || i.dest === "bar") && Number(i.qty) > 0)
+            .slice(0, 20)
+            .map(i => ({ name: String(i.name).slice(0, 60), dest: i.dest, qty: Math.min(Math.floor(Number(i.qty)), 20) }));
+          if (items.length === 0) return;
+          const req = { id: crypto.randomUUID(), table: msg.table, items, requestedAt: Date.now() };
+          this.repeatRequests.push(req);
+          const openedBy = this.openTables[msg.table] ? this.openTables[msg.table].openedBy : null;
+          const payload = { kind: "repeat_request", table: msg.table, requestId: req.id };
+          if (openedBy) this.notifyStaff(openedBy, payload);
+          else this.notify("waiter", payload);
+          this.log(conn, "guest_repeat_request", { table: msg.table });
+          await this.persist();
+          this.broadcast();
+        }
+
         if (msg.type === "acknowledge_table" && msg.table && conn.role === "waiter") {
           let changed = false;
           if (this.callingTables[msg.table]) { delete this.callingTables[msg.table]; changed = true; }
@@ -657,14 +694,29 @@ export class OrderBoard {
         }
 
         if (msg.type === "save_guest_order" && msg.deviceId && msg.table) {
-          const bill = this.computeTableBill(msg.table);
-          if (bill.hasOrders) {
-            const entry = { items: bill.items.map(i => ({ name: i.name, qty: i.qty })), ts: Date.now() };
-            const list = this.guestHistory[msg.deviceId] || [];
-            list.push(entry);
-            this.guestHistory[msg.deviceId] = list.slice(-5); // keep the last 5 visits only
-            this.tableGuestDevice[msg.table] = msg.deviceId;
-            await this.persist();
+          const session = this.openTables[msg.table];
+          if (session) {
+            const rounds = this.history.filter(h => h.table === msg.table && h.servedAt >= session.openedAt);
+            const activeOrders = this.orders.filter(o => o.table === msg.table);
+            const merged = {};
+            const addItems = (items, dest) => {
+              (items || []).forEach(i => {
+                const key = dest + "|" + i.name;
+                if (!merged[key]) merged[key] = { name: i.name, dest, qty: 0 };
+                merged[key].qty += i.qty;
+              });
+            };
+            rounds.forEach(r => { addItems(r.kitchenItems, "kitchen"); addItems(r.barItems, "bar"); });
+            activeOrders.forEach(o => { addItems(o.kitchenItems, "kitchen"); addItems(o.barItems, "bar"); });
+            const items = Object.values(merged);
+            if (items.length > 0) {
+              const entry = { items, ts: Date.now() };
+              const list = this.guestHistory[msg.deviceId] || [];
+              list.push(entry);
+              this.guestHistory[msg.deviceId] = list.slice(-5); // keep the last 5 visits only
+              this.tableGuestDevice[msg.table] = msg.deviceId;
+              await this.persist();
+            }
           }
         }
 
@@ -967,6 +1019,56 @@ export class OrderBoard {
           const dest = conn.role === "cook" ? "kitchen" : "bar";
           delete this.inventory[dest][msg.name];
           this.log(conn, "clear_stock", { dest, name: msg.name });
+          await this.persist();
+          this.broadcast();
+        }
+
+        if (msg.type === "confirm_repeat_request" && (conn.role === "waiter" || conn.role === "manager") && msg.requestId) {
+          const req = this.repeatRequests.find(r => r.id === msg.requestId);
+          if (req) {
+            this.repeatRequests = this.repeatRequests.filter(r => r.id !== msg.requestId);
+            const isAvailable = (dest, name) => !this.unavailable[dest + "|" + name];
+            const priceFor = (dest, name) => {
+              const cat = (this.menu[dest] || []).find(c => c.items.some(i => i.name.ru === name));
+              const item = cat && cat.items.find(i => i.name.ru === name);
+              return item ? item.price : "0";
+            };
+            const kitchenItems = req.items.filter(i => i.dest === "kitchen" && isAvailable("kitchen", i.name))
+              .map(i => ({ name: i.name, qty: i.qty, price: priceFor("kitchen", i.name), note: "" }));
+            const barItems = req.items.filter(i => i.dest === "bar" && isAvailable("bar", i.name))
+              .map(i => ({ name: i.name, qty: i.qty, price: priceFor("bar", i.name), note: "" }));
+            if (!this.openTables[req.table]) {
+              this.openTables[req.table] = { openedAt: Date.now(), openedBy: conn.staffId || null };
+            }
+            const order = {
+              id: crypto.randomUUID(),
+              table: req.table,
+              createdAt: Date.now(),
+              waiterName: conn.staffName || "",
+              waiterId: conn.staffId || null,
+              kitchenItems,
+              barItems,
+              kitchenStatus: kitchenItems.length ? "pending" : "none",
+              barStatus: barItems.length ? "pending" : "none",
+              kitchenAcceptedAt: null,
+              kitchenReadyAt: null,
+              barAcceptedAt: null,
+              barReadyAt: null,
+              cookName: null,
+              bartenderName: null,
+            };
+            this.orders.push(order);
+            this.log(conn, "confirm_repeat_request", { table: req.table });
+            await this.persist();
+            this.broadcast();
+            if (order.kitchenStatus === "pending") this.notify("cook", { table: order.table, orderId: order.id });
+            if (order.barStatus === "pending") this.notify("bartender", { table: order.table, orderId: order.id });
+          }
+        }
+
+        if (msg.type === "reject_repeat_request" && (conn.role === "waiter" || conn.role === "manager") && msg.requestId) {
+          this.repeatRequests = this.repeatRequests.filter(r => r.id !== msg.requestId);
+          this.log(conn, "reject_repeat_request", {});
           await this.persist();
           this.broadcast();
         }
