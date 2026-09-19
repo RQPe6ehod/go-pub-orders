@@ -234,6 +234,22 @@ export class OrderBoard {
       if (storedReturningGuestTables) this.returningGuestTables = storedReturningGuestTables;
       if (storedGuestHistory) this.guestHistory = storedGuestHistory;
       if (storedTableGuestDevice) this.tableGuestDevice = storedTableGuestDevice;
+
+      if (!this.staff.some(s => s.role === "manager")) {
+        // First run after switching managers over to personal accounts —
+        // carry the old shared PIN forward as the master manager's starting
+        // PIN, so whoever knew it before can still get in and rename
+        // themselves via the usual "Изменить имя" flow. Fixed id (not
+        // randomUUID) so RestoRUN's hardcoded handoff always matches.
+        this.staff.push({
+          id: "a0b1ae81-06fe-4e45-b95f-e7c3c2929a10",
+          role: "manager",
+          name: "Мастер-менеджер",
+          pin: this.pins.manager || "1111",
+          isMaster: true,
+        });
+        await this.persist();
+      }
     });
   }
 
@@ -558,24 +574,17 @@ export class OrderBoard {
             conn.role = msg.role;
             conn.staffId = staff.id;
             conn.staffName = staff.name || "";
+            conn.isMaster = !!staff.isMaster;
             conn.authed = true;
-          } else if (msg.role !== "manager") {
-            // Waiter/cook/bartender can no longer fall back to a shared PIN —
-            // a valid personal QR link (staffId) is required. This is what
-            // makes deleting/reassigning a staff member actually revoke access.
+          } else {
+            // No role can fall back to a shared PIN anymore — a valid
+            // personal QR link (staffId) is required for everyone,
+            // managers included. This is what makes deleting/reassigning a
+            // staff member (or a manager) actually revoke access.
             server.send(JSON.stringify({ type: "auth_error", reason: "staff_required" }));
             server.close(4001, "staff id required");
             this.sockets.delete(conn);
             return;
-          } else {
-            if (!this.checkPin(msg.role, msg.pin)) {
-              server.send(JSON.stringify({ type: "auth_error" }));
-              server.close(4001, "bad pin");
-              this.sockets.delete(conn);
-              return;
-            }
-            conn.role = msg.role;
-            conn.authed = true;
           }
           server.send(JSON.stringify({ type: "auth_ok" }));
           server.send(JSON.stringify(conn.role === "guest" ? this.guestSnapshot() : this.stateSnapshot()));
@@ -733,7 +742,9 @@ export class OrderBoard {
         }
 
         if (msg.type === "create_staff" && conn.role === "manager") {
+          if (msg.role === "manager" && !conn.isMaster) return; // only the master manager can appoint other managers
           const staff = { id: crypto.randomUUID(), role: msg.role, name: "", pin: "1111" };
+          if (msg.role === "manager") staff.isMaster = false; // newly appointed managers start as regular managers
           this.staff.push(staff);
           this.log(conn, "create_staff", { role: msg.role });
           await this.persist();
@@ -742,6 +753,7 @@ export class OrderBoard {
 
         if (msg.type === "delete_staff" && conn.role === "manager") {
           const staff = this.staff.find(s => s.id === msg.staffId);
+          if (staff && staff.role === "manager" && !conn.isMaster) return; // only the master manager can remove another manager
           this.staff = this.staff.filter(s => s.id !== msg.staffId);
           this.pushSubs = this.pushSubs.filter(p => p.staffId !== msg.staffId); // stop notifying a device once its staff record is gone
           this.log(conn, "delete_staff", { role: staff ? staff.role : null, name: staff ? staff.name : null });
@@ -751,10 +763,24 @@ export class OrderBoard {
 
         if (msg.type === "reassign_staff" && conn.role === "manager") {
           const staff = this.staff.find(s => s.id === msg.staffId);
+          if (staff && staff.role === "manager" && !conn.isMaster) return; // only the master manager can move another manager's device link
           if (staff) {
             this.pushSubs = this.pushSubs.filter(p => p.staffId !== staff.id); // old device's push binding no longer applies once the id rotates
             staff.id = crypto.randomUUID(); // old device's cached id stops matching anyone
             this.log(conn, "reassign_staff", { role: staff.role, name: staff.name });
+            await this.persist();
+            this.broadcast();
+          }
+        }
+
+        if (msg.type === "promote_master" && conn.role === "manager" && conn.isMaster && msg.staffId) {
+          // Hands mastership to another manager — exactly one master at a
+          // time, so the outgoing master demotes automatically.
+          const target = this.staff.find(s => s.id === msg.staffId && s.role === "manager");
+          if (target) {
+            this.staff.forEach(s => { if (s.role === "manager") s.isMaster = false; });
+            target.isMaster = true;
+            this.log(conn, "promote_master", { name: target.name });
             await this.persist();
             this.broadcast();
           }
