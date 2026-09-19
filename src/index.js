@@ -1199,7 +1199,14 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
 
     if (url.pathname === "/ws") {
-      const id = env.ORDER_BOARD.idFromName("main");
+      // Multi-venue support: a venue's own frontend appends ?venue=<slug> to
+      // its WS URL, giving it a completely separate Durable Object (its own
+      // staff/menu/tables/orders) under the exact same code. No venue param
+      // — including every GO pub file today — resolves to "main", so GO
+      // pub's existing address and data are entirely untouched by this.
+      let venue = (url.searchParams.get("venue") || "main").slice(0, 60);
+      if (!/^[a-z0-9-]+$/.test(venue)) venue = "main"; // reject anything odd rather than let it become a stray DO
+      const id = env.ORDER_BOARD.idFromName(venue);
       const stub = env.ORDER_BOARD.get(id);
       return stub.fetch(request);
     }
