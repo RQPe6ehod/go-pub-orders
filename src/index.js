@@ -535,6 +535,18 @@ export class OrderBoard {
     return String(pin || "") === String(expected);
   }
 
+  // Ties a known, consenting device to a table only at the moment it
+  // genuinely calls for service (waiter call, quick request, repeat
+  // request) — never from the guest page merely being open or reloading in
+  // the background, so a stray idle tab can't resurrect a stale binding.
+  recognizeReturningGuest(table, deviceId) {
+    if (!deviceId) return;
+    this.tableGuestDevice[table] = deviceId;
+    if ((this.guestHistory[deviceId] || []).length > 0) {
+      this.returningGuestTables[table] = true; // only true repeat visitors light up the table — not first-time consenters
+    }
+  }
+
   async fetch(request) {
     await this.ready;
     const url = new URL(request.url);
@@ -627,6 +639,7 @@ export class OrderBoard {
 
         if (msg.type === "call_waiter" && msg.table) {
           this.callingTables[msg.table] = true;
+          this.recognizeReturningGuest(msg.table, msg.deviceId);
           this.notify("waiter", { kind: "call_waiter", table: msg.table });
           this.log(conn, "call_waiter", { table: msg.table });
           await this.persist();
@@ -636,11 +649,13 @@ export class OrderBoard {
         if (msg.type === "guest_quick_request" && msg.table && msg.what) {
           const validWhats = ["cutlery", "napkins", "toothpicks", "salt_pepper", "order_problem"];
           if (!validWhats.includes(msg.what)) return;
+          this.recognizeReturningGuest(msg.table, msg.deviceId);
           const openedBy = this.openTables[msg.table] ? this.openTables[msg.table].openedBy : null;
           const payload = { kind: "quick_request", what: msg.what, table: msg.table };
           if (openedBy) this.notifyStaff(openedBy, payload);
           else this.notify("waiter", payload);
           this.log(conn, "guest_quick_request", { table: msg.table, what: msg.what });
+          await this.persist();
         }
 
         if (msg.type === "guest_repeat_request" && msg.table && Array.isArray(msg.items) && msg.items.length) {
@@ -649,6 +664,7 @@ export class OrderBoard {
             .slice(0, 20)
             .map(i => ({ name: String(i.name).slice(0, 60), dest: i.dest, qty: Math.min(Math.floor(Number(i.qty)), 20) }));
           if (items.length === 0) return;
+          this.recognizeReturningGuest(msg.table, msg.deviceId);
           const req = { id: crypto.randomUUID(), table: msg.table, items, requestedAt: Date.now() };
           this.repeatRequests.push(req);
           const openedBy = this.openTables[msg.table] ? this.openTables[msg.table].openedBy : null;
@@ -678,17 +694,6 @@ export class OrderBoard {
           else this.notify("waiter", { kind: "request_bill", table: msg.table });
           this.log(conn, "request_bill", { table: msg.table });
           await this.scheduleBillEscalation(msg.table);
-          await this.persist();
-          this.broadcast();
-        }
-
-        if (msg.type === "guest_at_table" && msg.deviceId && msg.table) {
-          // Only ever called by a device that has previously opted in — see
-          // save_guest_order below. Lets the waiter look up "usual order".
-          this.tableGuestDevice[msg.table] = msg.deviceId;
-          if ((this.guestHistory[msg.deviceId] || []).length > 0) {
-            this.returningGuestTables[msg.table] = true; // only true repeat visitors light up the table — not first-time consenters
-          }
           await this.persist();
           this.broadcast();
         }
