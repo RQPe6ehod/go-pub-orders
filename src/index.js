@@ -1295,6 +1295,7 @@ export class OrderBoard {
           delete this.openTables[table];
           delete this.billRequestedTables[table];
           delete this.returningGuestTables[table];
+          delete this.tableGuestDevice[table]; // closing the table ends this dining session — the next party at this table shouldn't inherit the last guest's identity
           this.pendingBillEscalations = this.pendingBillEscalations.filter(e => e.table !== table);
           this.closedTables.push(receipt);
           if (this.closedTables.length > CLOSED_TABLES_LIMIT) this.closedTables = this.closedTables.slice(-CLOSED_TABLES_LIMIT);
