@@ -175,6 +175,7 @@ export class OrderBoard {
     this.staff = [];       // [{id, role, name}]
     this.rooms = [{ id: "default", name: "Зал", tableCount: 20 }]; // [{id, name, tableCount}]
     this.unavailable = {}; // key "kitchen|Name" or "bar|Name" -> {comment, disabledBy, disabledAt}
+    this.wifi = { enabled: false, ssid: "", password: "" }; // guest wifi, shown as a button on the menu when enabled
     this.pins = { waiter: "1111", cook: "1111", bartender: "1111", manager: "1111" };
     this.inventory = { kitchen: {}, bar: {} }; // dest -> { "Name": {qty, threshold} }
     this.pushSubs = []; // [{id, role, staffId, subscription}]
@@ -199,6 +200,7 @@ export class OrderBoard {
       const storedRooms = await this.state.storage.get("rooms");
       const storedTableCount = await this.state.storage.get("tableCount"); // legacy, pre-rooms
       const storedUnavailable = await this.state.storage.get("unavailable");
+      const storedWifi = await this.state.storage.get("wifi");
       const storedPins = await this.state.storage.get("pins");
       const storedInventory = await this.state.storage.get("inventory");
       const storedPushSubs = await this.state.storage.get("pushSubs");
@@ -222,6 +224,7 @@ export class OrderBoard {
       if (storedRooms) this.rooms = storedRooms;
       else if (storedTableCount) this.rooms = [{ id: "default", name: "Зал", tableCount: storedTableCount }];
       if (storedUnavailable) this.unavailable = storedUnavailable;
+      if (storedWifi) this.wifi = storedWifi;
       if (storedPins) this.pins = storedPins;
       if (storedInventory) this.inventory = storedInventory;
       if (storedPushSubs) this.pushSubs = storedPushSubs;
@@ -264,6 +267,7 @@ export class OrderBoard {
     await this.state.storage.put("staff", this.staff);
     await this.state.storage.put("rooms", this.rooms);
     await this.state.storage.put("unavailable", this.unavailable);
+    await this.state.storage.put("wifi", this.wifi);
     await this.state.storage.put("pins", this.pins);
     await this.state.storage.put("inventory", this.inventory);
     await this.state.storage.put("pushSubs", this.pushSubs);
@@ -312,6 +316,7 @@ export class OrderBoard {
       billRequestedTables: this.billRequestedTables,
       returningGuestTables: this.returningGuestTables,
       repeatRequests: this.repeatRequests,
+      wifi: this.wifi,
       vapidPublicKey: this.env.VAPID_PUBLIC_KEY || null,
     };
   }
@@ -325,6 +330,7 @@ export class OrderBoard {
       menu: this.menu,
       unavailable: this.unavailable,
       vapidPublicKey: this.env.VAPID_PUBLIC_KEY || null,
+      wifi: this.wifi.enabled ? { ssid: this.wifi.ssid, password: this.wifi.password } : null,
     };
   }
 
@@ -681,6 +687,7 @@ export class OrderBoard {
           if (this.callingTables[msg.table]) { delete this.callingTables[msg.table]; changed = true; }
           if (this.billRequestedTables[msg.table]) { delete this.billRequestedTables[msg.table]; changed = true; }
           if (this.returningGuestTables[msg.table]) { delete this.returningGuestTables[msg.table]; changed = true; }
+          if (this.tableGuestDevice[msg.table]) { delete this.tableGuestDevice[msg.table]; changed = true; } // the "usual order" note is a one-time heads-up, not a standing fact — once a waiter has picked up this table, it's served its purpose
           const before = this.pendingBillEscalations.length;
           this.pendingBillEscalations = this.pendingBillEscalations.filter(e => e.table !== msg.table);
           if (this.pendingBillEscalations.length !== before) changed = true;
@@ -796,6 +803,17 @@ export class OrderBoard {
           } else {
             this.sendTo(conn, { type: "pin_change_error", reason: "invalid" });
           }
+        }
+
+        if (msg.type === "set_wifi" && conn.role === "manager") {
+          this.wifi = {
+            enabled: !!msg.enabled,
+            ssid: String(msg.ssid || "").slice(0, 60),
+            password: String(msg.password || "").slice(0, 80),
+          };
+          this.log(conn, "set_wifi", { enabled: this.wifi.enabled });
+          await this.persist();
+          this.broadcast();
         }
 
         if (msg.type === "create_staff" && conn.role === "manager") {
