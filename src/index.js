@@ -744,6 +744,14 @@ export class OrderBoard {
           const deviceId = this.tableGuestDevice[msg.table];
           const history = deviceId ? (this.guestHistory[deviceId] || []) : [];
           this.sendTo(conn, { type: "guest_history_result", table: msg.table, history });
+          if (deviceId) {
+            // One-time heads-up: once a waiter has been shown this, don't
+            // keep showing it — clearing here (not just on acknowledge)
+            // means it can't be orphaned by callingTables/returningGuestTables
+            // having already been cleared through some other path.
+            delete this.tableGuestDevice[msg.table];
+            await this.persist();
+          }
         }
 
         if (msg.type === "register_push" && msg.pushId && msg.subscription) {
