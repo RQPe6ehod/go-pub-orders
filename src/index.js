@@ -407,17 +407,22 @@ export class OrderBoard {
     const subs = this.pushSubs.filter(p =>
       p.role === role && (!p.staffId || this.staff.some(s => s.id === p.staffId))
     ); // staffId-less (manager) always kept; staff roles must still exist in the current roster
-    if (subs.length === 0) return;
+    if (subs.length === 0) { console.log(`[push] pushToRole(${role}): 0 subscriptions registered`); return; }
+    console.log(`[push] pushToRole(${role}): sending to ${subs.length} subscription(s)`);
     const text = this.pushText(message, role);
     subs.forEach(p => {
       sendWebPush(p.subscription, text, this.env)
         .then(async (resp) => {
+          console.log(`[push] pushToRole(${role}) id=${p.id}: status=${resp ? resp.status : "no-response"}`);
+          if (resp && !resp.ok) {
+            try { console.log(`[push] response body: ${(await resp.text()).slice(0, 300)}`); } catch (e2) {}
+          }
           if (resp && (resp.status === 404 || resp.status === 410)) {
             this.pushSubs = this.pushSubs.filter(x => x.id !== p.id);
             await this.persist();
           }
         })
-        .catch(() => {});
+        .catch((e) => { console.log(`[push] pushToRole(${role}) id=${p.id}: threw ${e && e.message}`); });
     });
   }
 
@@ -473,17 +478,22 @@ export class OrderBoard {
       }
     }
     const subs = this.pushSubs.filter(p => p.staffId === staffId);
-    if (subs.length === 0) return;
+    if (subs.length === 0) { console.log(`[push] notifyStaff(${staffId}): 0 subscriptions registered`); return; }
+    console.log(`[push] notifyStaff(${staffId}): sending to ${subs.length} subscription(s)`);
     const text = this.pushText(message, "waiter");
     subs.forEach(p => {
       sendWebPush(p.subscription, text, this.env)
         .then(async (resp) => {
+          console.log(`[push] notifyStaff(${staffId}) id=${p.id}: status=${resp ? resp.status : "no-response"}`);
+          if (resp && !resp.ok) {
+            try { console.log(`[push] response body: ${(await resp.text()).slice(0, 300)}`); } catch (e2) {}
+          }
           if (resp && (resp.status === 404 || resp.status === 410)) {
             this.pushSubs = this.pushSubs.filter(x => x.id !== p.id);
             await this.persist();
           }
         })
-        .catch(() => {});
+        .catch((e) => { console.log(`[push] notifyStaff(${staffId}) id=${p.id}: threw ${e && e.message}`); });
     });
   }
 
@@ -760,6 +770,7 @@ export class OrderBoard {
             p.id !== msg.pushId && (!endpoint || !p.subscription || p.subscription.endpoint !== endpoint)
           ); // a browser has exactly one real push subscription — stale role-bindings from testing other pages on this device get dropped here
           this.pushSubs.push({ id: msg.pushId, role: conn.role, staffId: conn.staffId || null, subscription: msg.subscription });
+          console.log(`[push] register_push: role=${conn.role} staffId=${conn.staffId || null} pushId=${msg.pushId} total=${this.pushSubs.length}`);
           await this.persist();
         }
 
