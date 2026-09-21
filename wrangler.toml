@@ -18,4 +18,6 @@ new_sqlite_classes = ["OrderBoard"]
 VAPID_PUBLIC_KEY = "BEcgGxZAt9ixrngaU78SVJYgquFAsY2fPGI7ASrpxXU8azqEHNUixNn4pbihJjGiZSAWs0K81octCrRx81xUi5I"
 VAPID_PRIVATE_KEY_PKCS8 = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgnpgRF8MKidE5C8/Sktl3wHn9JKQ2iuHQoAyvL5kWoiShRANCAARHIBsWQLfYsa54GlO/ElSWIKrhQLGNnzxiOwEq6cV1PGs6hBzVIsTZ+KW4oSYxomUgFrNCvNaHLQq0cfNcVIuS"
 VAPID_SUBJECT = "mailto:admin@kuatov.kz"
-
+[observability.logs]
+enabled = true
+invocation_logs = true
