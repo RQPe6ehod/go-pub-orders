@@ -383,7 +383,8 @@ export class OrderBoard {
   pushText(message, role) {
     const urlByRole = { waiter: "/waiter.html?view=board", cook: "/cook.html", bartender: "/bartender.html", manager: "/manager.html" };
     let url = urlByRole[role] || "/";
-    if (role === "waiter" && message.table !== undefined) url += "&table=" + encodeURIComponent(message.table);
+    if (role === "waiter" && message.kind === "call_waiter") url = "/waiter.html"; // fresh table calling — jump straight to the new-order screen with this table pre-selected, not the board
+    if (role === "waiter" && message.table !== undefined) url += (url.includes("?") ? "&" : "?") + "table=" + encodeURIComponent(message.table);
     if (message.kind === "low_stock") return { title: "GO pub — заканчивается", body: `${message.name} — осталось ${message.qty}`, url };
     if (message.kind === "call_waiter") return { title: "GO pub — зовут официанта", body: `Стол ${this.tableLabel(message.table)}`, url };
     if (message.kind === "quick_request") {
