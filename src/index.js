@@ -156,7 +156,7 @@ async function sendWebPush(subscription, payloadObj, env) {
       Authorization: auth,
       "Content-Type": "application/octet-stream",
       "Content-Encoding": "aes128gcm",
-      TTL: "60",
+      TTL: "86400", // was 60s — far too short for a screen-off phone; the push service (APNs/FCM) was dropping the notification entirely if it couldn't deliver within that window instead of holding and retrying. 24h keeps it queued for delivery whenever the device becomes reachable, while Urgency below still asks for immediate delivery when possible
       Urgency: "high", // ask the push service (FCM on Android) to attempt immediate delivery, waking the device from Doze mode rather than deferring until the screen turns on
     },
     body,
