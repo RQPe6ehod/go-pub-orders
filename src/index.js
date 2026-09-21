@@ -771,6 +771,7 @@ export class OrderBoard {
           ); // a browser has exactly one real push subscription — stale role-bindings from testing other pages on this device get dropped here
           this.pushSubs.push({ id: msg.pushId, role: conn.role, staffId: conn.staffId || null, subscription: msg.subscription });
           console.log(`[push] register_push: role=${conn.role} staffId=${conn.staffId || null} pushId=${msg.pushId} total=${this.pushSubs.length}`);
+          this.sendTo(conn, { type: "push_registered", total: this.pushSubs.length });
           await this.persist();
         }
 
