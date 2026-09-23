@@ -651,7 +651,7 @@ export class OrderBoard {
         if (!conn.authed) return; // ignore everything until hello succeeds
 
         if (msg.type === "get_table_bill" && msg.table) {
-          this.sendTo(conn, { type: "table_bill", table: msg.table, ...this.computeTableBill(msg.table) });
+          this.sendTo(conn, { type: "table_bill", table: msg.table, calling: !!this.callingTables[msg.table], ...this.computeTableBill(msg.table) });
         }
 
         if (msg.type === "call_waiter" && msg.table) {
