@@ -458,7 +458,7 @@ export class OrderBoard {
 
   computeTableBill(table) {
     const session = this.openTables[table];
-    if (!session) return { hasOrders: false, items: [], subtotal: 0, service: 0, total: 0, status: null };
+    if (!session) return { hasOrders: false, items: [], subtotal: 0, service: 0, total: 0, status: null, stations: { kitchen: null, bar: null } };
     const rounds = this.history.filter(h => h.table === table && h.servedAt >= session.openedAt);
     const activeOrders = this.orders.filter(o => o.table === table);
     const merged = {};
@@ -476,12 +476,26 @@ export class OrderBoard {
     const service = Math.round(subtotal * SERVICE_RATE);
 
     let status = null;
+    const stations = { kitchen: null, bar: null };
     if (items.length > 0) {
-      if (activeOrders.length === 0) status = "served"; // everything ordered so far has already been served
-      else status = activeOrders.every(o => this.isOrderFullyReady(o)) ? "ready" : "preparing";
+      if (activeOrders.length === 0) {
+        status = "served"; // everything ordered so far has already been served
+      } else {
+        status = activeOrders.every(o => this.isOrderFullyReady(o)) ? "ready" : "preparing";
+        const STAGE_RANK = { pending: 0, accepted: 1, ready: 2 };
+        const earliestStage = (getStatus, hasItems) => {
+          const relevant = activeOrders.filter(hasItems);
+          if (relevant.length === 0) return null; // nothing currently in flight for this station
+          let worst = 2;
+          relevant.forEach(o => { worst = Math.min(worst, STAGE_RANK[getStatus(o)] ?? 2); });
+          return Object.keys(STAGE_RANK).find(k => STAGE_RANK[k] === worst);
+        };
+        stations.kitchen = earliestStage(o => o.kitchenStatus, o => (o.kitchenItems || []).length > 0);
+        stations.bar = earliestStage(o => o.barStatus, o => (o.barItems || []).length > 0);
+      }
     }
 
-    return { hasOrders: items.length > 0, items, subtotal, service, total: subtotal + service, status };
+    return { hasOrders: items.length > 0, items, subtotal, service, total: subtotal + service, status, stations };
   }
 
   broadcast() {
