@@ -468,7 +468,13 @@ export class OrderBoard {
       openTables: filterKeyedByTable(this.openTables),
       closedTables: filterByTable(this.closedTables),
       staff: this.staff.filter(s => (forMonitor || s.role !== "monitor") && !!s.isTest === forTest),
-      rooms: this.rooms.filter(r => !!r.isTest === forTest),
+      // Room NAMES carry no live/sensitive data, only the table-number math
+      // depends on them — a test connection needs the real rooms too so its
+      // offset arithmetic for the test table stays correct, but a real
+      // connection must never see the test room. Every actual order/table
+      // state below still goes through keepTable(), so a test account never
+      // sees real occupancy regardless of which room names it can see.
+      rooms: forTest ? this.rooms : this.rooms.filter(r => !r.isTest),
       tableCount: this.rooms.reduce((s, r) => s + (r.tableCount || 0), 0), // kept for any old client still reading it
       unavailable: this.unavailable,
       inventory: this.inventory,
