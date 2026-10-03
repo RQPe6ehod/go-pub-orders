@@ -466,7 +466,7 @@ export class OrderBoard {
       orders: filterByTable(this.orders),
       history: filterByTable(this.history),
       openTables: filterKeyedByTable(this.openTables),
-      closedTables: filterKeyedByTable(this.closedTables),
+      closedTables: filterByTable(this.closedTables),
       staff: this.staff.filter(s => (forMonitor || s.role !== "monitor") && !!s.isTest === forTest),
       rooms: this.rooms.filter(r => !!r.isTest === forTest),
       tableCount: this.rooms.reduce((s, r) => s + (r.tableCount || 0), 0), // kept for any old client still reading it
