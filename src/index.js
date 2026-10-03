@@ -300,6 +300,25 @@ export class OrderBoard {
         });
         await this.persist();
       }
+
+      if (!this.rooms.some(r => r.isTest)) {
+        // A fully isolated sandbox for the automated smoke test — a test
+        // room/table, test waiter/cook/manager, and a signed QR for that
+        // table, all bootstrapped here so nobody ever has to touch the real
+        // manager UI (which can't even create these — see the isTest guards
+        // on create_room/create_staff) to set this up. Fixed ids so they
+        // stay stable across deploys; not logged, same as the monitor above.
+        const offset = this.rooms.reduce((s, r) => s + (r.tableCount || 0), 0);
+        this.rooms.push({ id: "3b6e9c1a-2f84-4a10-9e6c-1d7a5f803c2b", name: "Тест", tableCount: 1, isTest: true });
+        const testTable = offset + 1;
+        this.staff.push({ id: "9a1e4d7c-6b23-4f95-8c01-2e7b9a4d1f36", role: "waiter", name: "", pin: "1111", isTest: true });
+        this.staff.push({ id: "c4f8b2e6-1a75-4d3c-9b8e-5f2a01c9d7e4", role: "cook", name: "", pin: "1111", isTest: true });
+        this.staff.push({ id: "5d2a8f1e-9c4b-4e76-8a3d-0f6e2b9c4a17", role: "manager", name: "", pin: "1111", isTest: true });
+        const qrId = await signQrId(this.env.QR_SIGNING_SECRET);
+        this.qrAssignments[qrId] = testTable;
+        await this.persist();
+        console.log(`[test-setup] room=3b6e9c1a-2f84-4a10-9e6c-1d7a5f803c2b table=${testTable} waiter=9a1e4d7c-6b23-4f95-8c01-2e7b9a4d1f36 cook=c4f8b2e6-1a75-4d3c-9b8e-5f2a01c9d7e4 manager=5d2a8f1e-9c4b-4e76-8a3d-0f6e2b9c4a17 qrId=${qrId}`);
+      }
     });
   }
 
@@ -330,12 +349,14 @@ export class OrderBoard {
   }
 
   log(conn, action, details) {
+    const d = details || {};
     const entry = {
       ts: Date.now(),
       role: conn.role || null,
       staffName: conn.staffName || null,
       action,
-      details: details || {},
+      details: d,
+      isTest: !!conn.isTest || (d.table !== undefined && this.testTableNumbers().has(d.table)),
     };
     this.actionLog.push(entry);
     if (this.actionLog.length > 1000) this.actionLog = this.actionLog.slice(-1000);
@@ -417,27 +438,48 @@ export class OrderBoard {
     });
   }
 
+  testTableNumbers() {
+    const set = new Set();
+    let offset = 0;
+    for (const room of this.rooms) {
+      if (room.isTest) {
+        for (let n = offset + 1; n <= offset + room.tableCount; n++) set.add(n);
+      }
+      offset += room.tableCount;
+    }
+    return set;
+  }
+
   stateSnapshot(opts) {
-    const hideMonitor = !opts || opts.hideMonitor !== false; // default true — only a monitor connection ever passes hideMonitor:false
+    const forTest = !!(opts && opts.forTest); // true only for a test-flagged staff connection
+    const forMonitor = !!(opts && opts.forMonitor); // true only for the monitor connection itself
+    const testTables = this.testTableNumbers();
+    const keepTable = (t) => forTest ? testTables.has(t) : !testTables.has(t);
+    const filterByTable = (arr) => arr.filter(x => keepTable(x.table));
+    const filterKeyedByTable = (obj) => {
+      const out = {};
+      for (const k in obj) if (keepTable(parseInt(k, 10))) out[k] = obj[k];
+      return out;
+    };
     return {
       type: "state",
-      orders: this.orders,
-      history: this.history,
-      openTables: this.openTables,
-      closedTables: this.closedTables,
-      staff: hideMonitor ? this.staff.filter(s => s.role !== "monitor") : this.staff,
-      rooms: this.rooms,
+      orders: filterByTable(this.orders),
+      history: filterByTable(this.history),
+      openTables: filterKeyedByTable(this.openTables),
+      closedTables: filterKeyedByTable(this.closedTables),
+      staff: this.staff.filter(s => (forMonitor || s.role !== "monitor") && !!s.isTest === forTest),
+      rooms: this.rooms.filter(r => !!r.isTest === forTest),
       tableCount: this.rooms.reduce((s, r) => s + (r.tableCount || 0), 0), // kept for any old client still reading it
       unavailable: this.unavailable,
       inventory: this.inventory,
-      actionLog: hideMonitor ? this.actionLog.filter(e => e.role !== "monitor") : this.actionLog,
+      actionLog: this.actionLog.filter(e => (forMonitor || e.role !== "monitor") && !!e.isTest === forTest),
       menu: this.menu,
-      qrAssignments: this.qrAssignments,
-      cancelRequests: this.cancelRequests,
-      callingTables: this.callingTables,
-      billRequestedTables: this.billRequestedTables,
-      returningGuestTables: this.returningGuestTables,
-      repeatRequests: this.repeatRequests,
+      qrAssignments: Object.fromEntries(Object.entries(this.qrAssignments).filter(([, t]) => keepTable(t))),
+      cancelRequests: filterByTable(this.cancelRequests),
+      callingTables: filterKeyedByTable(this.callingTables),
+      billRequestedTables: filterKeyedByTable(this.billRequestedTables),
+      returningGuestTables: filterKeyedByTable(this.returningGuestTables),
+      repeatRequests: filterByTable(this.repeatRequests),
       wifi: this.wifi,
       vapidPublicKey: this.env.VAPID_PUBLIC_KEY || null,
     };
@@ -500,22 +542,28 @@ export class OrderBoard {
 
   broadcast() {
     const fullPayload = JSON.stringify(this.stateSnapshot());
-    const monitorPayload = JSON.stringify(this.stateSnapshot({ hideMonitor: false }));
+    const monitorPayload = JSON.stringify(this.stateSnapshot({ forMonitor: true }));
+    const testPayload = JSON.stringify(this.stateSnapshot({ forTest: true }));
     const guestPayload = JSON.stringify(this.guestSnapshot());
     for (const client of this.sockets) {
-      const payload = client.role === "guest" ? guestPayload : (client.role === "monitor" ? monitorPayload : fullPayload);
+      let payload;
+      if (client.role === "guest") payload = guestPayload;
+      else if (client.role === "monitor") payload = monitorPayload;
+      else if (client.isTest) payload = testPayload;
+      else payload = fullPayload;
       try { client.ws.send(payload); } catch (e) { /* ignore dead sockets */ }
     }
   }
 
   notify(role, message) {
+    const isTestEvent = message.table !== undefined && this.testTableNumbers().has(message.table);
     const payload = JSON.stringify({ type: "notify", ...message });
     for (const client of this.sockets) {
-      if (client.role === role) {
+      if (client.role === role && !!client.isTest === isTestEvent) {
         try { client.ws.send(payload); } catch (e) {}
       }
     }
-    this.pushToRole(role, message);
+    this.pushToRole(role, message, isTestEvent);
   }
 
   pushText(message, role) {
@@ -542,12 +590,15 @@ export class OrderBoard {
     return { title: "GO pub", body: "Новое уведомление", url };
   }
 
-  pushToRole(role, message) {
-    const subs = this.pushSubs.filter(p =>
-      p.role === role && (!p.staffId || this.staff.some(s => s.id === p.staffId))
-    ); // staffId-less (manager) always kept; staff roles must still exist in the current roster
-    if (subs.length === 0) { console.log(`[push] pushToRole(${role}): 0 subscriptions registered`); return; }
-    console.log(`[push] pushToRole(${role}): sending to ${subs.length} subscription(s)`);
+  pushToRole(role, message, isTestEvent) {
+    const subs = this.pushSubs.filter(p => {
+      if (p.role !== role) return false;
+      const owner = p.staffId ? this.staff.find(s => s.id === p.staffId) : null;
+      if (p.staffId && !owner) return false; // staff record gone — stale subscription
+      return !!(owner && owner.isTest) === !!isTestEvent;
+    });
+    if (subs.length === 0) { console.log(`[push] pushToRole(${role}${isTestEvent ? ", test" : ""}): 0 subscriptions registered`); return; }
+    console.log(`[push] pushToRole(${role}${isTestEvent ? ", test" : ""}): sending to ${subs.length} subscription(s)`);
     const text = this.pushText(message, role);
     subs.forEach(p => {
       sendWebPush(p.subscription, text, this.env)
@@ -752,6 +803,7 @@ export class OrderBoard {
             conn.staffId = staff.id;
             conn.staffName = staff.name || "";
             conn.isMaster = !!staff.isMaster;
+            conn.isTest = !!staff.isTest;
             conn.authed = true;
           } else {
             // No role can fall back to a shared PIN anymore — a valid
@@ -764,7 +816,7 @@ export class OrderBoard {
             return;
           }
           server.send(JSON.stringify({ type: "auth_ok" }));
-          server.send(JSON.stringify(conn.role === "guest" ? this.guestSnapshot() : this.stateSnapshot({ hideMonitor: conn.role !== "monitor" })));
+          server.send(JSON.stringify(conn.role === "guest" ? this.guestSnapshot() : this.stateSnapshot({ forMonitor: conn.role === "monitor", forTest: !!conn.isTest })));
           return;
         }
 
@@ -980,10 +1032,25 @@ export class OrderBoard {
           if (msg.role === "monitor") return; // the monitor role is never created through the manager UI — it's a hidden, bootstrap-only account
           const staff = { id: crypto.randomUUID(), role: msg.role, name: "", pin: "1111" };
           if (msg.role === "manager") staff.isMaster = false; // newly appointed managers start as regular managers
+          if (msg.isTest) staff.isTest = true;
           this.staff.push(staff);
           this.log(conn, "create_staff", { role: msg.role });
           await this.persist();
+          this.sendTo(conn, { type: "staff_created", staff });
           this.broadcast();
+        }
+
+        if (msg.type === "get_test_setup" && conn.role === "manager") {
+          const testRoom = this.rooms.find(r => r.isTest);
+          const testStaff = this.staff.filter(s => s.isTest);
+          const testQr = Object.entries(this.qrAssignments).find(([, t]) => testRoom && this.testTableNumbers().has(t));
+          this.sendTo(conn, {
+            type: "test_setup_info",
+            room: testRoom || null,
+            staff: testStaff,
+            qrId: testQr ? testQr[0] : null,
+            table: testQr ? testQr[1] : null,
+          });
         }
 
         if (msg.type === "set_notify_prefs" && conn.role === "monitor" && msg.prefs) {
@@ -1034,10 +1101,13 @@ export class OrderBoard {
         }
 
         if (msg.type === "create_room" && conn.role === "manager") {
-          const room = { id: crypto.randomUUID(), name: String(msg.name || "Зал").slice(0, 40), tableCount: 10 };
+          const offset = this.rooms.reduce((s, r) => s + (r.tableCount || 0), 0);
+          const room = { id: crypto.randomUUID(), name: String(msg.name || "Зал").slice(0, 40), tableCount: msg.isTest ? 1 : 10 };
+          if (msg.isTest) room.isTest = true;
           this.rooms.push(room);
           this.log(conn, "create_room", { name: room.name });
           await this.persist();
+          this.sendTo(conn, { type: "room_created", room, firstTableNumber: offset + 1, lastTableNumber: offset + room.tableCount });
           this.broadcast();
         }
 
