@@ -511,6 +511,44 @@ export class OrderBoard {
     if (changed) { console.log(`[migrate] ${this.venue}: ${changed} menu fields updated`); this.broadcast(); }
   }
 
+  // One-time (GO pub only): adds the «Акция: Guinness 0,5 (2+1)» menu item at
+  // 7 980 and records the 27 promo sets sold 1–31 Oct 2026 as ONE clearly
+  // flagged manual receipt (manual:true, closedBy "Внесено вручную") dated
+  // 31 Oct, so the monthly analytics/report shows the count and amount.
+  // Idempotent via the "migrations" list and fixed ids.
+  async migratePromoGuinness() {
+    const MIGRATION = "promo-guinness-oct2026-v1";
+    if (this.venue && this.venue !== "main") return;
+    const done = (await this.state.storage.get("migrations")) || [];
+    if (done.includes(MIGRATION)) return;
+    const NAME = "Акция: Guinness 0,5 (2+1)";
+    const PRICE = 7980, QTY = 27;
+    if (!this.menu.bar) this.menu.bar = [];
+    let cat = this.menu.bar.find(c => c.id === "promo-cat-0001");
+    if (!cat) {
+      cat = { id: "promo-cat-0001", title: { ru: "Акции", en: "Promotions", kk: "Акциялар" },
+        note: { ru: "2 пива по цене набора — третье в подарок", en: "Buy 2, get the 3rd free", kk: "2 сыра — үшіншісі сыйлық" }, items: [] };
+      this.menu.bar.unshift(cat);
+    }
+    if (!cat.items.some(i => i.id === "promo-guinness-2p1")) {
+      cat.items.push({ id: "promo-guinness-2p1",
+        name: { ru: NAME, en: "Promo: Guinness 0.5 (2+1)", kk: "Акция: Guinness 0,5 (2+1)" },
+        price: "7 980" });
+    }
+    if (!this.closedTables.some(r => r.id === "manual-guinness-oct2026")) {
+      const closedAt = Date.UTC(2026, 9, 31, 7, 0, 0); // 31 Oct 2026, 12:00 Almaty
+      const total = PRICE * QTY;
+      const receipt = { id: "manual-guinness-oct2026", table: "—", openedAt: closedAt, closedAt,
+        closedBy: "Внесено вручную", manual: true,
+        items: [{ name: NAME, qty: QTY, price: PRICE }], subtotal: total, service: 0, total };
+      const idx = this.closedTables.findIndex(r => r.closedAt > closedAt);
+      if (idx === -1) this.closedTables.push(receipt); else this.closedTables.splice(idx, 0, receipt);
+    }
+    await this.persist();
+    await this.state.storage.put("migrations", [...done, MIGRATION]);
+    this.broadcast();
+  }
+
   // One-time: brings Kazakh names/descriptions/section titles of an already
   // seeded venue menu up to the venue's starting menu (fixes wrong or missing
   // kk text). Only touches entries whose Russian text the manager hasn't
@@ -951,6 +989,7 @@ export class OrderBoard {
     await this.adoptVenue(request.headers.get("X-Venue"));
     await this.migrateVenueMenu();
     await this.migrateVenueTranslations();
+    await this.migratePromoGuinness();
     const url = new URL(request.url);
     if (url.pathname.startsWith("/img/")) return this.serveImage(decodeURIComponent(url.pathname.slice(5)));
 
